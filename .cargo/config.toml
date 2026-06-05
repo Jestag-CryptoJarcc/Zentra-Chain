@@ -1,0 +1,9 @@
+[build]
+# Use all available cores for compilation
+jobs = 8
+
+# NOTE: we intentionally do NOT set `target-cpu=native`.
+# Native CPU optimisation produces binaries that crash on other machines'
+# CPUs (SIGILL / illegal instruction). Released binaries must be portable,
+# so we keep the default generic target. For a faster build tuned to YOUR
+# machine only, run:  RUSTFLAGS="-C target-cpu=native" cargo build --release

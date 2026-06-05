@@ -1,0 +1,10 @@
+target
+zentra-data
+*-data
+web
+scratch
+*.exe
+*.log
+*.log.bak
+.git
+.github

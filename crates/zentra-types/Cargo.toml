@@ -1,0 +1,19 @@
+[package]
+name = "zentra-types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core types and constants for the Zentra L1 BlockDAG network"
+
+[dependencies]
+serde = { workspace = true }
+borsh = { workspace = true }
+blake2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+bech32 = "0.11"
+
+[dev-dependencies]
+serde_json = { workspace = true }

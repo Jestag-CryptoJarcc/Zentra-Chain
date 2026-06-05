@@ -1,0 +1,20 @@
+[package]
+name = "zentra-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WebAssembly execution runtime, gas metering, and governance for Zentra L1"
+
+[dependencies]
+zentra-types = { workspace = true }
+serde = { workspace = true }
+borsh = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+hex = { workspace = true }
+wasmi = "0.42"
+
+[dev-dependencies]
+serde_json = { workspace = true }
+wat = "1"

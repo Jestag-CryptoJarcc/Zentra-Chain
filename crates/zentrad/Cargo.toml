@@ -1,0 +1,38 @@
+[package]
+name = "zentrad"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Zentra L1 node daemon with P2P networking, RPC server, and mining"
+
+[[bin]]
+name = "zentrad"
+path = "src/main.rs"
+
+[dependencies]
+zentra-types = { workspace = true }
+zentra-core = { workspace = true }
+zentra-consensus = { workspace = true }
+zentra-runtime = { workspace = true }
+zentra-finance = { workspace = true }
+zentra-wallet = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+borsh = { workspace = true }
+thiserror = { workspace = true }
+ed25519-dalek = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+parking_lot = { workspace = true }
+hex = { workspace = true }
+anyhow = { workspace = true }
+toml = "0.8"
+jsonrpsee = { version = "0.25", features = ["server", "macros"] }
+libp2p = { version = "0.55", features = ["tcp", "noise", "yamux", "gossipsub", "kad", "identify", "mdns", "tokio", "macros"] }
+async-trait = "0.1"
+num_cpus = "1"
+tower-http = { version = "0.5", features = ["cors"] }
+tower = "0.5"
+hyper = { version = "1.0", features = ["full"] }

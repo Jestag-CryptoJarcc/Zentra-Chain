@@ -1,0 +1,28 @@
+[package]
+name = "zentra-wallet"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HD wallet generation, address management, and transaction signing for Zentra L1"
+
+[dependencies]
+zentra-types = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+borsh = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+ed25519-dalek = { workspace = true }
+rand = { workspace = true }
+rand_core = { workspace = true }
+blake2 = { workspace = true }
+hex = { workspace = true }
+bip39 = { version = "2.1", features = ["rand_core"] }
+hmac = "0.12"
+sha2 = { workspace = true }
+aes-gcm = "0.10"
+argon2 = "0.5"
+zeroize = { version = "1.8", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "3"

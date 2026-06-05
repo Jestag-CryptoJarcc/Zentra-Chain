@@ -1,0 +1,23 @@
+[package]
+name = "zentra-finance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Embedded DEX, AMM, protocol-owned liquidity, TSS vault, and quarantine for Zentra L1"
+
+[dependencies]
+zentra-types = { workspace = true }
+zentra-core = { workspace = true }
+serde = { workspace = true }
+borsh = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+primitive-types = { workspace = true }
+rand = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+blake2 = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

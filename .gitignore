@@ -1,0 +1,47 @@
+# ─── Rust build artifacts ───────────────────────────────────────────────
+/target
+**/target
+**/*.rs.bk
+*.pdb
+
+# ─── Built binaries (distributed via GitHub Releases, not committed) ─────
+/zentrad.exe
+/zentra-qt.exe
+/zentra-cli.exe
+/zentrad
+/zentra-qt
+/zentra-cli
+*.exe
+
+# ─── Wallet & node DATA — NEVER COMMIT (contains private keys/seeds) ─────
+/zentra-data/
+/zentra-smoke-mainnet/
+*-data/
+**/db/
+*mnemonic*.txt
+pool_wallet.txt
+pool_operator.txt
+derived_address.tmp
+wallet_theme.json
+*.log
+*.log.bak
+
+# ─── Runtime web asset copy (source lives in crates/zentrad/web) ─────────
+/web/
+
+# ─── Public website — hosted separately, NOT part of this repo ───────────
+/crates/zentrad/web/
+
+# ─── Scratch / temp ──────────────────────────────────────────────────────
+/scratch/
+*.tmp
+*.bak
+
+# ─── OS / editor cruft ───────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*~
