@@ -84,6 +84,15 @@ fn decode_block(hexs: &str) -> Option<zentra_core::block::Block> {
     borsh::from_slice::<zentra_core::block::Block>(&bytes).ok()
 }
 
+fn encode_tx(t: &zentra_core::transaction::Transaction) -> String {
+    hex::encode(borsh::to_vec(t).unwrap_or_default())
+}
+
+fn decode_tx(hexs: &str) -> Option<zentra_core::transaction::Transaction> {
+    let bytes = hex::decode(hexs).ok()?;
+    borsh::from_slice::<zentra_core::transaction::Transaction>(&bytes).ok()
+}
+
 // ── listener (server) ────────────────────────────────────────────────────────
 
 /// Start the inbound P2P listener. Serves block requests and accepts announces.
@@ -180,6 +189,24 @@ fn handle_inbound(node: Arc<ZentraNode>, mut s: TcpStream) -> std::io::Result<()
                     "peer_count": node.peer_stats.lock().len(),
                     "pool_active_miners": node.pool.lock().active_count(),
                 }))?;
+            }
+            // Transaction relay: a peer asks for our pending txs.
+            "getmempool" => {
+                let txs: Vec<String> = node.mempool_snapshot().iter().map(encode_tx).collect();
+                send_json(&mut s, &json!({"t":"mempool","txs":txs}))?;
+            }
+            // Transaction relay: a peer pushes us pending txs to add to our mempool.
+            "addtxs" => {
+                if let Some(arr) = msg["txs"].as_array() {
+                    let mut added = 0u32;
+                    for h in arr {
+                        if let Some(tx) = h.as_str().and_then(decode_tx) {
+                            if node.accept_external_tx(tx) { added += 1; }
+                        }
+                    }
+                    if added > 0 { debug!(added, "accepted relayed transactions"); }
+                }
+                send_json(&mut s, &json!({"t":"addtxs_ack"}))?;
             }
             "bye" => return Ok(()),
             _ => {}
@@ -343,6 +370,26 @@ fn sync_from_peer(node: &Arc<ZentraNode>, addr: &str) -> std::io::Result<()> {
         // If the peer sent a partial-but-no-progress batch, stop to avoid looping.
         if accepted == 0 { break; }
         if arr.len() < SYNC_BATCH { break; }
+    }
+
+    // ── Transaction relay ──────────────────────────────────────────────────
+    // Pull the peer's pending transactions into our mempool, then push ours to
+    // them. This propagates txs created on one node (faucet claims, pool
+    // payouts, wallet sends) to every node, so whoever is mining can include
+    // them in a block. Without this, a tx only ever gets mined by the node it
+    // was created on.
+    let _ = send_json(&mut s, &json!({"t":"getmempool"}));
+    if let Ok(resp) = recv_json(&mut s) {
+        if let Some(arr) = resp["txs"].as_array() {
+            for h in arr {
+                if let Some(tx) = h.as_str().and_then(decode_tx) { node.accept_external_tx(tx); }
+            }
+        }
+    }
+    let ours: Vec<String> = node.mempool_snapshot().iter().map(encode_tx).collect();
+    if !ours.is_empty() {
+        let _ = send_json(&mut s, &json!({"t":"addtxs","txs":ours}));
+        let _ = recv_json(&mut s); // consume ack
     }
     Ok(())
 }

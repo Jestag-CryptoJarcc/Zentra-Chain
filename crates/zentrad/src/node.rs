@@ -462,8 +462,16 @@ impl ZentraNode {
             return;
         }
 
-        // Pool wallet balance (confirmed UTXOs).
-        let utxos = self.utxo_set.lock().get_utxos_for_address(&pool_address);
+        // Pool wallet balance — only MATURE UTXOs. Coinbase outputs can't be
+        // spent until they mature, so a payout that includes an immature
+        // coinbase would be rejected by the validator and stick in the mempool
+        // forever. Filtering here keeps every payout transaction valid.
+        let cur_h = self.current_height();
+        const COINBASE_MATURITY: u64 = 10;
+        let utxos: Vec<_> = self.utxo_set.lock().get_utxos_for_address(&pool_address)
+            .into_iter()
+            .filter(|(_, e)| !e.is_coinbase || cur_h >= e.block_height.saturating_add(COINBASE_MATURITY))
+            .collect();
         let balance: u64 = utxos.iter().map(|(_, e)| e.amount.as_zents()).sum();
         if balance <= crate::pool::PAYOUT_TX_FEE_ZENTS {
             // Nothing to pay; just reset the timer so we don't spin.
@@ -797,8 +805,67 @@ impl ZentraNode {
         let mut h = self.block_history.lock();
         h.push(block.clone());
         if h.len() > 100 { h.remove(0); }
+        drop(h);
+
+        // Pool block accounting: if we're the operator and this block's coinbase
+        // paid the shared pool wallet, count it as a pool block (remote miners
+        // find these, so the local mining worker never sees them).
+        if self.pool_mode.load(std::sync::atomic::Ordering::Relaxed) {
+            let pool_addr = self.pool.lock().address.clone();
+            let paid_pool = block.transactions.first()
+                .filter(|tx| tx.is_coinbase())
+                .map(|cb| cb.outputs.iter().any(|o| matches!(o,
+                    zentra_core::transaction::TxOutput::Standard { address, .. } if address.to_string() == pool_addr)))
+                .unwrap_or(false);
+            if paid_pool { self.pool.lock().blocks_found += 1; }
+        }
+
         tracing::info!(height, hash = %hash, "accepted block from peer");
         true
+    }
+
+    /// Snapshot of current mempool transactions (for P2P relay).
+    pub fn mempool_snapshot(&self) -> Vec<zentra_core::transaction::Transaction> {
+        self.mempool.get_transactions_for_block(1000)
+    }
+
+    /// Accept a transaction relayed from a peer: validate it the same way the
+    /// block validator would (signatures, inputs exist & mature, outputs ≤
+    /// inputs), compute its fee, and add it to the mempool. Returns true if it
+    /// was newly added. This is what lets a pending tx created on one node
+    /// (faucet claim, pool payout, a wallet send) reach the miners on OTHER
+    /// nodes so it can actually be included in a block.
+    pub fn accept_external_tx(&self, tx: zentra_core::transaction::Transaction) -> bool {
+        use zentra_core::transaction::{OutPoint, TxOutput};
+        let txid = tx.txid();
+        if tx.is_coinbase() { return false; }            // coinbase only inside blocks
+        if self.mempool.contains(&txid) { return false; } // already have it
+        if tx.verify_signatures().is_err() { return false; }
+
+        let cur_h = self.current_height();
+        const COINBASE_MATURITY: u64 = 10;
+        let utxo = self.utxo_set.lock();
+        let mut in_sum: u64 = 0;
+        for inp in &tx.inputs {
+            let op = OutPoint::new(inp.prev_tx_hash, inp.output_index);
+            match utxo.get_utxo(&op) {
+                Some(e) => {
+                    if e.is_coinbase && cur_h < e.block_height.saturating_add(COINBASE_MATURITY) {
+                        return false; // spends immature coinbase — would never validate
+                    }
+                    in_sum = in_sum.saturating_add(e.amount.as_zents());
+                }
+                None => return false, // we don't have the input — can't validate/mine it
+            }
+        }
+        drop(utxo);
+        let out_sum: u64 = tx.outputs.iter().map(|o| match o {
+            TxOutput::Standard { amount, .. } => amount.as_zents(),
+            TxOutput::Burn { amount, .. } => amount.as_zents(),
+        }).sum();
+        if out_sum > in_sum { return false; }
+        let fee = in_sum - out_sum;
+        self.mempool.add_transaction(tx, Amount::from_zents(fee)).is_ok()
     }
 
     /// Return the OLDEST `limit` blocks on the selected chain with
