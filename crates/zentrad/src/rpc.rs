@@ -440,7 +440,7 @@ impl ZentraRpcServer for RpcServer {
             peers.push(serde_json::json!({
                 "id": id,
                 "address": addr,
-                "version": "/ZentraCore:0.1.0/",
+                "version": concat!("/ZentraCore:", env!("CARGO_PKG_VERSION"), "/"),
                 "ping_ms": if last_seen < 10_000 { last_seen } else { 0 },
                 "height": stat.map(|s| s.height).unwrap_or(blue_score),
                 "direction": "manual",
@@ -455,7 +455,7 @@ impl ZentraRpcServer for RpcServer {
                 peers.push(serde_json::json!({
                     "id": id,
                     "address": addr,
-                    "version": "/ZentraCore:0.1.0/",
+                    "version": concat!("/ZentraCore:", env!("CARGO_PKG_VERSION"), "/"),
                     "ping_ms": 0,
                     "height": stat.height,
                     "direction": "inbound",

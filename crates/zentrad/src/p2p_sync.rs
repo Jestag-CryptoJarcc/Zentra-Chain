@@ -37,6 +37,24 @@ use zentra_types::Hash;
 const MAX_FRAME: usize = 4 * 1024 * 1024; // 4 MB safety cap (a block is < 1 MB)
 const SYNC_BATCH: usize = 500;
 
+/// RAII marker that counts an in-flight peer sync. Increments `node.active_syncs`
+/// on creation and decrements on drop, so the count is correct even when
+/// `sync_from_peer` returns early via `?`. The miner pauses while the count > 0.
+struct SyncGuard {
+    count: Arc<std::sync::atomic::AtomicUsize>,
+}
+impl SyncGuard {
+    fn new(node: &Arc<ZentraNode>) -> Self {
+        node.active_syncs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        SyncGuard { count: Arc::clone(&node.active_syncs) }
+    }
+}
+impl Drop for SyncGuard {
+    fn drop(&mut self) {
+        self.count.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Baked-in seed nodes that a freshly-downloaded wallet auto-connects to.
 /// These are the always-on bootstrap nodes for the network — put your seed
 /// server's public IP(s) here (port 16110 must be reachable / port-forwarded).
@@ -409,7 +427,10 @@ fn sync_from_peer(node: &Arc<ZentraNode>, addr: &str) -> std::io::Result<()> {
         }
     }
 
-    node.is_syncing.store(true, std::sync::atomic::Ordering::Relaxed);
+    // RAII sync marker: increments active_syncs now and decrements on EVERY exit
+    // path (including the `?`/`break` early returns below), so the miner only
+    // resumes once the last concurrent peer sync has finished.
+    let _sync_guard = SyncGuard::new(node);
 
     // Pull blocks above our height, repeatedly, until we stop making progress.
     loop {
@@ -459,8 +480,7 @@ fn sync_from_peer(node: &Arc<ZentraNode>, addr: &str) -> std::io::Result<()> {
         node.try_connect_orphans();
         if !got_any { break; }
     }
-
-    node.is_syncing.store(false, std::sync::atomic::Ordering::Relaxed);
+    // (_sync_guard is dropped at function exit, clearing this peer's sync marker.)
 
     // ── Transaction relay ──────────────────────────────────────────────────
     // Pull the peer's pending transactions into our mempool, then push ours to

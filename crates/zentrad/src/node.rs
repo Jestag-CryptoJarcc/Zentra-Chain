@@ -60,6 +60,10 @@ pub struct ZentraNode {
     // Dynamic mining state
     pub is_mining: Arc<AtomicBool>,
     pub is_syncing: Arc<AtomicBool>,
+    /// Number of peer-sync operations currently in flight. The miner pauses while
+    /// this is > 0. A plain bool flag was racy: with several concurrent peer
+    /// threads the first to finish cleared it while others were still syncing.
+    pub active_syncs: Arc<std::sync::atomic::AtomicUsize>,
     pub miner_lane: Arc<AtomicU8>,
     pub miner_threads: Arc<AtomicU8>,
     pub miner_address: Arc<parking_lot::Mutex<Option<Address>>>,
@@ -260,6 +264,7 @@ impl ZentraNode {
             block_history,
             is_mining,
             is_syncing: Arc::new(AtomicBool::new(false)),
+            active_syncs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             miner_lane,
             miner_threads,
             miner_address,
@@ -301,8 +306,8 @@ impl ZentraNode {
             info!("Background mining worker thread spawned");
             loop {
                 if self_clone.is_mining.load(std::sync::atomic::Ordering::Relaxed) {
-                    // Don't mine while we are actively syncing blocks from a peer.
-                    if self_clone.is_syncing.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Don't mine while ANY peer sync is in flight.
+                    if self_clone.active_syncs.load(std::sync::atomic::Ordering::Relaxed) > 0 {
                         std::thread::sleep(std::time::Duration::from_millis(500));
                         continue;
                     }
@@ -324,15 +329,23 @@ impl ZentraNode {
                     let lane_u8 = self_clone.miner_lane.load(std::sync::atomic::Ordering::Relaxed);
                     let lane = LaneId::from_u8(lane_u8).unwrap_or(LaneId::Cpu);
 
-                    let height = if let Ok(Some(selected_tip)) = self_clone.dag.get_selected_tip() {
-                        if let Ok(Some(header)) = self_clone.dag.get_header(&selected_tip) {
-                            header.blue_score + 1
-                        } else {
-                            1
-                        }
-                    } else {
-                        1
+                    // Compute this block's GhostDAG data over its REAL parent set,
+                    // using exactly the same algorithm the validator runs in
+                    // connect_block. Stamping the header from this (instead of a
+                    // naive selected_tip+1) is what makes merge blocks validate.
+                    let (blue_score, blue_work) = {
+                        let get_ghostdag = |h: &Hash| -> Option<zentra_consensus::ghostdag::GhostdagData> {
+                            if let Ok(Some(bytes)) = self_clone.dag.get_ghostdag_raw(h) {
+                                borsh::BorshDeserialize::try_from_slice(&bytes).ok()
+                            } else {
+                                None
+                            }
+                        };
+                        let manager = zentra_consensus::ghostdag::GhostdagManager::default_k();
+                        let gd = manager.process_block(&Hash::ZERO, &parents, &get_ghostdag);
+                        (gd.blue_score, gd.blue_work)
                     };
+                    let height = blue_score;
 
                     // Build the block's tx list by validating EACH candidate
                     // individually against the current UTXO set (mirroring
@@ -390,7 +403,8 @@ impl ZentraNode {
                         parents,
                         txs,
                         bits,
-                        height,
+                        blue_score,
+                        blue_work,
                         fees,
                         &self_clone.emission,
                     );
@@ -611,13 +625,12 @@ impl ZentraNode {
     /// Process incoming peer stats: update the stats map and register the peer
     /// as a pool miner if this node is the pool operator.
     pub fn apply_peer_stats(&self, stat: PeerMinerStat) {
-        // Register as pool miner if we're running pool-operator mode.
-        if self.pool_mode.load(std::sync::atomic::Ordering::Relaxed)
-            && stat.pool_mining && !stat.payout_address.is_empty()
-        {
-            let mut pool = self.pool.lock();
-            pool.heartbeat(&stat.payout_address, stat.hashrate);
-        }
+        // NOTE: we deliberately do NOT credit pool shares from a peer's
+        // self-reported P2P stats. Crediting an unverified, attacker-chosen
+        // hashrate let any remote node claim the pool payout. Pool shares are now
+        // only driven by the operator's authenticated private RPC until they are
+        // replaced by verified proof-of-work shares. The stats below are used for
+        // (display-only) network-hashrate aggregation, never for payouts.
         // Key by a STABLE identity, NOT the ephemeral ip:port. A miner reconnects
         // every few seconds with a new source port; keying by ip:port would make
         // a fresh entry each time and multi-count its hashrate. Prefer the payout
@@ -798,6 +811,41 @@ impl ZentraNode {
         Ok(())
     }
 
+    /// Validation that depends ONLY on the block itself (not on which chain it is
+    /// on), so it is correct for every accepted block — including non-selected
+    /// side blocks. Checks merkle root, coinbase position, signatures on every
+    /// non-coinbase input, and intra-block double-spends. UTXO-dependent checks
+    /// (ownership, fee/subsidy, coinbase maturity) are applied separately when a
+    /// block joins the selected chain in `reorganize`.
+    pub fn validate_block_self_contained(&self, block: &Block) -> Result<(), String> {
+        use std::collections::HashSet;
+        use zentra_core::transaction::OutPoint;
+
+        if !block.validate_merkle_root() {
+            return Err("merkle root mismatch".into());
+        }
+        if block.transactions.is_empty() {
+            return Err("block has no transactions".into());
+        }
+
+        let mut seen_inputs: HashSet<OutPoint> = HashSet::new();
+        for (i, tx) in block.transactions.iter().enumerate() {
+            let is_cb = tx.is_coinbase();
+            if i == 0 && !is_cb { return Err("first transaction must be coinbase".into()); }
+            if i > 0 && is_cb { return Err("only the first transaction may be coinbase".into()); }
+            if is_cb { continue; }
+
+            tx.verify_signatures().map_err(|e| format!("signature: {e}"))?;
+            for inp in &tx.inputs {
+                let op = OutPoint::new(inp.prev_tx_hash, inp.output_index);
+                if !seen_inputs.insert(op.clone()) {
+                    return Err(format!("double-spend within block: {}:{}", op.tx_hash, op.index));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn validate_block_transactions(&self, block: &Block, utxo: &UtxoSet) -> Result<(), String> {
         use std::collections::{HashMap, HashSet};
         use zentra_core::transaction::{OutPoint, TxOutput};
@@ -846,10 +894,13 @@ impl ZentraNode {
                     in_sum = in_sum.saturating_add(val);
                     spent.insert(op);
                 }
+                // saturating fold (not .sum()) so a crafted peer tx with huge
+                // output amounts can't overflow u64 (panic in debug / wrap in
+                // release, which could hide outputs > inputs and mint value).
                 let out_sum: u64 = tx.outputs.iter().map(|o| match o {
                     TxOutput::Standard { amount, .. } => amount.as_zents(),
                     TxOutput::Burn { amount, .. } => amount.as_zents(),
-                }).sum();
+                }).fold(0u64, |a, b| a.saturating_add(b));
                 if out_sum > in_sum {
                     return Err(format!("outputs {} exceed inputs {}", out_sum, in_sum));
                 }
@@ -1075,6 +1126,18 @@ impl ZentraNode {
             return false;
         }
 
+        // Self-contained transaction validation runs for EVERY accepted block,
+        // including side/parallel blocks that don't become the selected tip.
+        // Previously these were inserted and relayed with no tx validation at all
+        // (full UTXO validation only happened in reorganize when a block joined
+        // the selected chain), so a forged-signature/malformed-coinbase side block
+        // could propagate network-wide. The UTXO-dependent checks (ownership,
+        // fees, maturity) still happen on selection in reorganize.
+        if let Err(e) = self.validate_block_self_contained(block) {
+            tracing::warn!(height = block.header.blue_score, hash = %hash, reason = %e, "rejected peer block — invalid transactions");
+            return false;
+        }
+
         // Compute GhostDAG data
         let get_ghostdag = |h: &Hash| -> Option<zentra_consensus::ghostdag::GhostdagData> {
             if let Ok(Some(bytes)) = self.dag.get_ghostdag_raw(h) {
@@ -1095,13 +1158,24 @@ impl ZentraNode {
             return false;
         }
 
+        // Persist the GhostDAG data FIRST, then the block. Ordering matters for
+        // crash-safety: if we die between the two writes, a stray ghostdag entry
+        // with no block is harmless (get_block returns None → the block is just
+        // re-fetched and the ghostdag overwritten). The reverse — a block with no
+        // ghostdag — silently bricks every descendant (they resolve the parent to
+        // genesis → blue_score 1 → permanent "blue_score mismatch"). Both writes
+        // are mandatory; a failure aborts the connect.
+        let gd_bytes = match borsh::to_vec(&expected_data) {
+            Ok(b) => b,
+            Err(e) => { tracing::error!(err = %e, "failed to serialize ghostdag — block rejected"); return false; }
+        };
+        if let Err(e) = self.dag.put_ghostdag_raw(&hash, &gd_bytes) {
+            tracing::error!(err = %e, "failed to persist ghostdag — block rejected");
+            return false;
+        }
         if let Err(e) = self.dag.insert_block(block) {
             tracing::debug!(err = %e, "rejected peer block — dag insert failed");
             return false;
-        }
-
-        if let Ok(bytes) = borsh::to_vec(&expected_data) {
-            let _ = self.dag.put_ghostdag_raw(&hash, &bytes);
         }
 
         // Get new selected tip AFTER DAG insertion

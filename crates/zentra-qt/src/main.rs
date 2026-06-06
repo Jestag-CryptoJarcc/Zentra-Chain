@@ -598,7 +598,9 @@ impl ZentraApp {
             if let Ok(tag) = std::fs::read_to_string(&tmp) {
                 let tag = tag.trim().to_string();
                 let _ = std::fs::remove_file(&tmp);
-                if !tag.is_empty() && tag != CURRENT {
+                // Only offer when the remote tag is a strictly-higher semver than
+                // ours — never on an equal tag, a downgrade, or a malformed tag.
+                if !tag.is_empty() && tag != CURRENT && semver_gt(&tag, CURRENT) {
                     self.update_available = Some(tag);
                 }
             }
@@ -1352,7 +1354,7 @@ impl eframe::App for ZentraApp {
                     ui.label(egui::RichText::new("Node & Wallet").size(13.0).strong().color(col_text));
                     ui.add_space(8.0);
                     kv(ui, "Network", &net_name, col_muted, col_text);
-                    kv(ui, "RPC endpoint", "127.0.0.1:16111", col_muted, col_text);
+                    kv(ui, "RPC endpoint", &node_rpc_hostport(), col_muted, col_text);
                     kv(ui, "Web dashboard", "zentrachain.xyz", col_muted, col_text);
                     kv(ui, "Data directory", &data_dir().display().to_string(), col_muted, col_text);
                     ui.add_space(10.0);
@@ -3034,7 +3036,7 @@ fn tab_network(
         group(&mut cols[0], col_surface, col_border, |ui| {
             ui.label(egui::RichText::new("Node Diagnostics").size(13.0).strong().color(col_text));
             ui.add_space(8.0);
-            kv(ui, "Client",          "Zentra Core v0.1.0", col_muted, col_text);
+            kv(ui, "Client",          concat!("Zentra Core v", env!("CARGO_PKG_VERSION")), col_muted, col_text);
             kv(ui, "Protocol",        &format!("{}", proto_ver), col_muted, col_blue);
             kv(ui, "Network",          net_name, col_muted, col_blue);
             kv(ui, "Block Height",    &format!("{}", height), col_muted, col_green);
@@ -3829,11 +3831,54 @@ fn read_rpc_token() -> String {
     String::new()
 }
 
+/// Default node the wallet talks to: a node running on this machine.
+const DEFAULT_NODE_RPC: &str = "http://127.0.0.1:16111";
+
+/// The node RPC endpoint. Overridable with the `ZENTRA_NODE_URL` env var so a
+/// user can point the wallet at a remote/seed node instead of a local one.
+fn node_rpc_url() -> String {
+    std::env::var("ZENTRA_NODE_URL").ok()
+        .map(|s| s.trim().trim_end_matches('/').to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_NODE_RPC.to_string())
+}
+
+/// `host:port` form of the configured node, for raw TCP reachability checks.
+fn node_rpc_hostport() -> String {
+    node_rpc_url()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .trim_end_matches('/')
+        .to_string()
+}
+
+/// True when the wallet is pointed at a node other than the default local one;
+/// in that case the wallet must NOT spawn or kill a local daemon.
+fn using_remote_node() -> bool {
+    node_rpc_url() != DEFAULT_NODE_RPC
+}
+
+/// Parse a "vX.Y.Z" (or "X.Y.Z") tag into a comparable (major, minor, patch)
+/// tuple. Missing/garbage components become 0.
+fn parse_semver(s: &str) -> (u64, u64, u64) {
+    let s = s.trim().trim_start_matches('v').trim_start_matches('V');
+    let mut it = s.split(|c| c == '.' || c == '-' || c == '+');
+    let major = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let minor = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    let patch = it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    (major, minor, patch)
+}
+
+/// True only when `remote` is a strictly-higher semver than `current`.
+fn semver_gt(remote: &str, current: &str) -> bool {
+    parse_semver(remote) > parse_semver(current)
+}
+
 fn call_rpc(method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
     let body = json!({ "jsonrpc": "2.0", "method": method, "params": params, "id": 1 });
     let token = read_rpc_token();
     let auth_header = format!("Bearer {}", token);
-    let resp = ureq::post("http://127.0.0.1:16111")
+    let resp = ureq::post(&node_rpc_url())
         .timeout(std::time::Duration::from_secs(8))
         .set("Content-Type", "application/json")
         .set("Authorization", &auth_header)
@@ -4001,7 +4046,9 @@ fn pp(v: serde_json::Value) -> String {
 // ─── Daemon management ────────────────────────────────────────────────────────
 
 fn spawn_daemon() -> Option<Child> {
-    if TcpStream::connect("127.0.0.1:16111").is_ok() { return None; }
+    // If the user pointed us at a remote node, never spawn a local daemon.
+    if using_remote_node() { return None; }
+    if TcpStream::connect(node_rpc_hostport().as_str()).is_ok() { return None; }
     let dir = data_dir();
     std::fs::create_dir_all(&dir).ok();
     let log = std::fs::File::create(dir.join("zentrad.log")).ok();
@@ -4025,10 +4072,12 @@ fn spawn_daemon() -> Option<Child> {
 }
 
 fn kill_daemon(daemon: &Arc<Mutex<Option<Child>>>) {
+    // Never stop/kill a node we don't own (remote node, or a separately-run one).
+    if using_remote_node() { return; }
     let _ = call_rpc("stopNode", json!([]));
     for _ in 0..20 {
         std::thread::sleep(Duration::from_millis(100));
-        if TcpStream::connect("127.0.0.1:16111").is_err() {
+        if TcpStream::connect(node_rpc_hostport().as_str()).is_err() {
             *daemon.lock().unwrap() = None;
             return;
         }

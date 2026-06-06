@@ -81,15 +81,26 @@ impl Miner {
     }
 
     /// Build a block template ready for mining.
+    ///
+    /// `blue_score`/`blue_work` MUST be the GhostDAG values computed for this
+    /// block's parent set (via `GhostdagManager::process_block`), so the header
+    /// the miner signs is exactly what every validator independently recomputes.
+    /// Deriving them from a naive `selected_tip + 1` height was the source of the
+    /// "blue_score mismatch" rejections on merge blocks.
     pub fn build_block_template(
         &self,
         parent_hashes: Vec<Hash>,
         transactions: Vec<Transaction>,
         difficulty_bits: u32,
-        height: u64,
+        blue_score: u64,
+        blue_work: u128,
         fees: Amount,
         emission: &EmissionSchedule,
     ) -> Block {
+        // The block's height for emission/coinbase purposes is its blue_score,
+        // matching how the validator applies the block (apply_block uses
+        // header.blue_score as the UTXO height).
+        let height = blue_score;
         let reward = emission.block_reward(height).saturating_add(fees);
         let coinbase = Transaction::create_coinbase(reward, self.address.clone(), height);
 
@@ -110,8 +121,8 @@ impl Miner {
             nonce: 0,
             lane_id: self.lane,
             bits: difficulty_bits,
-            blue_score: height,
-            blue_work: height as u128,
+            blue_score,
+            blue_work,
             pruning_point: Hash::ZERO,
         };
 
@@ -252,6 +263,7 @@ mod tests {
             vec![],
             Header::easiest_bits(),
             1,
+            1,
             Amount::ZERO,
             &emission,
         );
@@ -273,6 +285,7 @@ mod tests {
             vec![Hash::ZERO],
             vec![],
             Header::easiest_bits(), // very easy difficulty
+            0,
             0,
             Amount::ZERO,
             &emission,

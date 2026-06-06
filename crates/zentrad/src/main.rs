@@ -40,7 +40,7 @@ struct Cli {
     data_dir: Option<String>,
 
     /// Network: mainnet, testnet, devnet
-    #[arg(long, default_value = "mainnet")]
+    #[arg(long, default_value = "devnet")]
     network: String,
 
     /// Enable wallet mode
@@ -313,19 +313,29 @@ fn faucet_allow(ip: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// Best-effort client IP: prefer the proxy-supplied original IP (Cloudflare /
-/// nginx) over the socket peer, which behind a reverse proxy is just 127.0.0.1.
+/// Client IP for faucet rate-limiting.
+///
+/// `cf-connecting-ip` / `x-forwarded-for` are trusted ONLY when the operator
+/// runs behind a real reverse proxy and opts in with `ZENTRA_TRUST_PROXY_HEADERS=1`.
+/// Otherwise a directly-exposed node would let anyone spoof these headers to mint
+/// a fresh per-IP bucket on every request and drain the faucet. Default: trust
+/// the real socket peer.
 fn client_ip(req: &str, peer: std::net::SocketAddr) -> String {
-    for line in req.lines() {
-        let ll = line.to_ascii_lowercase();
-        if let Some(v) = ll.strip_prefix("cf-connecting-ip:") {
-            let v = v.trim();
-            if !v.is_empty() { return v.to_string(); }
-        }
-        if let Some(v) = ll.strip_prefix("x-forwarded-for:") {
-            if let Some(first) = v.split(',').next() {
-                let first = first.trim();
-                if !first.is_empty() { return first.to_string(); }
+    let trust_headers = std::env::var("ZENTRA_TRUST_PROXY_HEADERS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if trust_headers {
+        for line in req.lines() {
+            let ll = line.to_ascii_lowercase();
+            if let Some(v) = ll.strip_prefix("cf-connecting-ip:") {
+                let v = v.trim();
+                if !v.is_empty() { return v.to_string(); }
+            }
+            if let Some(v) = ll.strip_prefix("x-forwarded-for:") {
+                if let Some(first) = v.split(',').next() {
+                    let first = first.trim();
+                    if !first.is_empty() { return first.to_string(); }
+                }
             }
         }
     }
@@ -417,9 +427,14 @@ async fn start_web_server(port: u16, token: String) -> anyhow::Result<()> {
                             "getNetworkInfo", "getMiningStatus", "getMiningInfo",
                             // AMM
                             "getPoolState",
-                            // mining pool (views & member calls)
+                            // mining pool (READ-ONLY views only). poolJoin /
+                            // poolHeartbeat are intentionally NOT public: they
+                            // credit payout shares from a self-reported hashrate,
+                            // so exposing them unauthenticated let any remote
+                            // attacker claim the whole pool payout. They are now
+                            // private-RPC only (operator-managed) until share
+                            // accounting is replaced with verified PoW shares.
                             "poolGetInfo", "poolGetMiners", "poolGetPayouts",
-                            "poolJoin", "poolHeartbeat",
                             // faucet (faucetClaim is rate-limited below)
                             "faucetInfo", "faucetClaim",
                         ];

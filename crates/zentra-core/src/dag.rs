@@ -126,23 +126,27 @@ impl DagGraph {
     /// Get the selected tip (tip with highest blue score).
     pub fn get_selected_tip(&self) -> ZentraResult<Option<Hash>> {
         let tips = self.get_tips();
-        let mut best_tip: Option<(Hash, u64)> = None;
-
+        // Deterministic selection so every node picks the SAME tip given the same
+        // DAG: highest blue_score, then highest blue_work, then lowest hash as a
+        // canonical tie-break. Without the tie-break, equal-score tips resolved to
+        // whichever happened to be first in the (per-node, restart-varying) tips
+        // list — a silent fork source.
+        let mut best: Option<(u64, u128, Hash)> = None; // (blue_score, blue_work, hash)
         for tip in &tips {
             if let Some(header) = self.get_header(tip)? {
-                match &best_tip {
-                    Some((_, best_score)) if header.blue_score > *best_score => {
-                        best_tip = Some((*tip, header.blue_score));
+                let cand = (header.blue_score, header.blue_work, *tip);
+                let better = match &best {
+                    None => true,
+                    Some((bs, bw, bh)) => {
+                        cand.0 > *bs
+                            || (cand.0 == *bs && cand.1 > *bw)
+                            || (cand.0 == *bs && cand.1 == *bw && cand.2 < *bh)
                     }
-                    None => {
-                        best_tip = Some((*tip, header.blue_score));
-                    }
-                    _ => {}
-                }
+                };
+                if better { best = Some(cand); }
             }
         }
-
-        Ok(best_tip.map(|(hash, _)| hash))
+        Ok(best.map(|(_, _, hash)| hash))
     }
 
     /// Check if `ancestor` is an ancestor of `descendant` in the DAG.
