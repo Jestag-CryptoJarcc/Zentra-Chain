@@ -665,7 +665,35 @@ impl ZentraApp {
                     use std::io::Read;
                     let mut reader = resp.into_reader();
                     let mut buf = Vec::new();
-                    if reader.read_to_end(&mut buf).is_ok() && std::fs::write(&zip_path, &buf).is_ok() {
+                    if reader.read_to_end(&mut buf).is_err() {
+                        *prog.lock().unwrap() = "Update failed: download was interrupted.".into();
+                        return;
+                    }
+                    // INTEGRITY CHECK: fetch the release's checksums.txt and confirm
+                    // the downloaded zip's SHA-256 matches the published value BEFORE
+                    // we write or extract anything. This blocks a corrupted download
+                    // or a CDN/mirror swapping the binary out from under us. (Full
+                    // authenticity still wants a signature — tracked separately.)
+                    *prog.lock().unwrap() = "Verifying download…".into();
+                    let sums_url = "https://github.com/Jestag-CryptoJarcc/Zentra-Chain/releases/latest/download/checksums.txt";
+                    let want = ureq::get(sums_url).timeout(Duration::from_secs(60)).call()
+                        .ok().and_then(|r| r.into_string().ok());
+                    let computed = {
+                        use sha2::{Sha256, Digest};
+                        let mut h = Sha256::new();
+                        h.update(&buf);
+                        hex::encode(h.finalize())
+                    };
+                    let verified = want.as_ref().map(|txt| txt.lines().any(|line| {
+                        let l = line.to_ascii_lowercase();
+                        l.contains("zentra-windows-x64.zip") && l.contains(&computed)
+                    })).unwrap_or(false);
+                    if !verified {
+                        *prog.lock().unwrap() =
+                            "Update aborted: checksum did not match the published release. Download manually from GitHub.".into();
+                        return;
+                    }
+                    if std::fs::write(&zip_path, &buf).is_ok() {
                         *prog.lock().unwrap() = "Preparing installer…".into();
                         let dir_str = exe_dir.to_string_lossy().replace('\'', "''");
                         let script = SELF_UPDATE_PS1

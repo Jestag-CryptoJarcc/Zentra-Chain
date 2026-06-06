@@ -21,6 +21,10 @@
 *mnemonic*.txt
 pool_wallet.txt
 pool_operator.txt
+faucet_wallet.txt
+*seed*.txt
+*.enc
+*.key
 derived_address.tmp
 wallet_theme.json
 *.log

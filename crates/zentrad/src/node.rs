@@ -32,6 +32,11 @@ use zentra_finance::vault::OmniVault;
 use zentra_finance::quarantine::QuarantineManager;
 use zentra_finance::encrypted_mempool::EncryptedMempool;
 
+/// Minimum fee (in zents) a transaction must pay to be relayed/mined. Mirrors
+/// Bitcoin's minRelayTxFee — it stops zero-fee dust from flooding the mempool.
+/// MUST stay ≤ the faucet fee (1000) so faucet/wallet sends still relay.
+pub const MIN_RELAY_FEE_ZENTS: u64 = 1000;
+
 /// The Zentra node — orchestrates all subsystems.
 pub struct ZentraNode {
     pub config: NodeConfig,
@@ -71,6 +76,14 @@ pub struct ZentraNode {
     /// Pool stats learned from the operator via stats_ack (for member display).
     pub learned_pool_miners: Arc<AtomicU64>,
     pub learned_pool_hashrate: Arc<parking_lot::Mutex<f64>>,
+    /// Highest block height any peer has advertised — the mining worker won't
+    /// mine while we are far below this (so a fresh/behind node syncs the
+    /// existing chain instead of mining its own competing fork).
+    pub max_peer_height: Arc<AtomicU64>,
+    /// Blocks received whose parents we don't have yet, keyed by block hash.
+    pub orphans: Arc<parking_lot::Mutex<std::collections::HashMap<Hash, Block>>>,
+    /// Parent hashes we are missing and should fetch from peers (getblock).
+    pub wanted: Arc<parking_lot::Mutex<std::collections::HashSet<Hash>>>,
 
     /// Manually-added peer addresses (host:port).
     pub manual_peers: Arc<parking_lot::Mutex<Vec<String>>>,
@@ -262,6 +275,9 @@ impl ZentraNode {
             pool_member_payout: Arc::new(parking_lot::Mutex::new(String::new())),
             learned_pool_miners: Arc::new(AtomicU64::new(0)),
             learned_pool_hashrate: Arc::new(parking_lot::Mutex::new(0.0)),
+            max_peer_height: Arc::new(AtomicU64::new(0)),
+            orphans: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            wanted: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             manual_peers: Arc::new(parking_lot::Mutex::new(Vec::new())),
             mine_throttle_ms: Arc::new(AtomicU64::new(0)),
             peer_stats: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -289,6 +305,14 @@ impl ZentraNode {
             info!("Background mining worker thread spawned");
             loop {
                 if self_clone.is_mining.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Don't mine our own fork while a peer is well ahead — sync
+                    // the existing chain first. This is what prevents two nodes
+                    // from each mining a competing branch from the same genesis.
+                    let peer_h = self_clone.max_peer_height.load(std::sync::atomic::Ordering::Relaxed);
+                    if peer_h > self_clone.current_height().saturating_add(3) {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        continue;
+                    }
                     let pool_active = self_clone.pool_mode.load(std::sync::atomic::Ordering::Relaxed);
                     let payout_address = if pool_active {
                         // Pool-operator mode: every block reward goes to the pool wallet.
@@ -304,11 +328,6 @@ impl ZentraNode {
                     };
 
                     let parents = self_clone.dag.get_tips();
-                    let txs = self_clone.mempool.get_transactions_for_block(10);
-                    let fees = txs
-                        .iter()
-                        .filter_map(|tx| self_clone.mempool.get_fee(&tx.txid()))
-                        .fold(Amount::ZERO, |acc, fee| acc.saturating_add(fee));
                     let lane_u8 = self_clone.miner_lane.load(std::sync::atomic::Ordering::Relaxed);
                     let lane = LaneId::from_u8(lane_u8).unwrap_or(LaneId::Cpu);
 
@@ -320,6 +339,49 @@ impl ZentraNode {
                         }
                     } else {
                         1
+                    };
+
+                    // Build the block's tx list by validating EACH candidate
+                    // individually against the current UTXO set (mirroring
+                    // validate_full_block). A tx that is invalid from this node's
+                    // view is EVICTED from the mempool instead of poisoning the
+                    // whole block — so any single valid tx is always mineable and
+                    // a node never gets stuck unable to confirm anything.
+                    let (txs, fees) = {
+                        use zentra_core::transaction::{OutPoint, TxOutput};
+                        let candidates = self_clone.mempool.get_transactions_for_block(20);
+                        let utxo = self_clone.utxo_set.lock();
+                        let mut spent: std::collections::HashSet<OutPoint> = std::collections::HashSet::new();
+                        let mut chosen: Vec<zentra_core::transaction::Transaction> = Vec::new();
+                        let mut fee_sum = Amount::ZERO;
+                        const MATURITY: u64 = 10;
+                        for tx in candidates {
+                            let txid = tx.txid();
+                            if tx.is_coinbase() { self_clone.mempool.remove_transaction(&txid); continue; }
+                            if tx.verify_signatures().is_err() { self_clone.mempool.remove_transaction(&txid); continue; }
+                            let mut ok = true; let mut in_sum = 0u64;
+                            for inp in &tx.inputs {
+                                let op = OutPoint::new(inp.prev_tx_hash, inp.output_index);
+                                if spent.contains(&op) { ok = false; break; }
+                                match utxo.get_utxo(&op) {
+                                    Some(e) if (!e.is_coinbase || height >= e.block_height.saturating_add(MATURITY))
+                                        && Address::from_public_key(&inp.public_key, self_clone.config.network) == e.address => {
+                                        in_sum = in_sum.saturating_add(e.amount.as_zents());
+                                    }
+                                    _ => { ok = false; break; }
+                                }
+                            }
+                            if !ok { self_clone.mempool.remove_transaction(&txid); continue; }
+                            let out_sum: u64 = tx.outputs.iter().map(|o| match o {
+                                TxOutput::Standard { amount, .. } | TxOutput::Burn { amount, .. } => amount.as_zents(),
+                            }).sum();
+                            if out_sum > in_sum { self_clone.mempool.remove_transaction(&txid); continue; }
+                            for inp in &tx.inputs { spent.insert(OutPoint::new(inp.prev_tx_hash, inp.output_index)); }
+                            fee_sum = fee_sum.saturating_add(Amount::from_zents(in_sum - out_sum));
+                            chosen.push(tx);
+                            if chosen.len() >= 10 { break; }
+                        }
+                        (chosen, fee_sum)
                     };
 
                     let bits = self_clone.difficulty.lock().get_next_difficulty(lane);
@@ -663,6 +725,48 @@ impl ZentraNode {
             return Err("block timestamp too far in the future".into());
         }
 
+        // 2d. median-time-past: a block's timestamp must exceed the median of its
+        // last 11 ancestors. Walking the block's OWN parent chain (not global
+        // history) keeps this branch-safe during sync. This is Bitcoin's
+        // GetMedianTimePast rule — it stops a miner dragging timestamps backward
+        // to game difficulty without tripping the future-time cap. We only
+        // enforce it once enough ancestors exist (genesis region is exempt).
+        {
+            let mut times: Vec<u64> = Vec::with_capacity(11);
+            let mut cursor: Vec<Hash> = block.header.parents.clone();
+            let mut visited: HashSet<Hash> = HashSet::new();
+            while times.len() < 11 {
+                // pick the heaviest unvisited parent as the chain to walk back
+                let mut next: Option<(Hash, Header)> = None;
+                for p in &cursor {
+                    if !visited.contains(p) {
+                        if let Ok(Some(h)) = self.dag.get_header(p) {
+                            if next.as_ref().map_or(true, |(_, nh)| h.blue_score > nh.blue_score) {
+                                next = Some((*p, h));
+                            }
+                        }
+                    }
+                }
+                match next {
+                    Some((ph, hdr)) => {
+                        visited.insert(ph);
+                        times.push(hdr.timestamp);
+                        cursor = hdr.parents.clone();
+                    }
+                    None => break,
+                }
+            }
+            if times.len() >= 11 {
+                times.sort_unstable();
+                let mtp = times[times.len() / 2];
+                if block.header.timestamp <= mtp {
+                    return Err(format!(
+                        "block timestamp {} not after median-time-past {}",
+                        block.header.timestamp, mtp));
+                }
+            }
+        }
+
         // 3. merkle root
         if !block.validate_merkle_root() {
             return Err("merkle root mismatch".into());
@@ -688,7 +792,8 @@ impl ZentraNode {
         // 5/6. per-transaction UTXO + signature + fee checks
         let utxo = self.utxo_set.lock();
         let mut spent: HashSet<OutPoint> = HashSet::new();
-        let mut created: HashMap<OutPoint, u64> = HashMap::new();
+        // outpoint -> (amount, owner address) for outputs created earlier in THIS block
+        let mut created: HashMap<OutPoint, (u64, Address)> = HashMap::new();
         let mut total_fees: u64 = 0;
 
         for (i, tx) in block.transactions.iter().enumerate() {
@@ -704,7 +809,9 @@ impl ZentraNode {
                     if spent.contains(&op) {
                         return Err(format!("double-spend within block: {}:{}", op.tx_hash, op.index));
                     }
-                    let val = if let Some(e) = utxo.get_utxo(&op) {
+                    // The address that owns the output being spent — used to prove
+                    // the spender actually owns these coins (see ownership check).
+                    let (val, owner) = if let Some(e) = utxo.get_utxo(&op) {
                         // Coinbase outputs are locked until they mature, exactly
                         // like Bitcoin's 100-confirmation coinbase rule.
                         const COINBASE_MATURITY: u64 = 10;
@@ -712,12 +819,18 @@ impl ZentraNode {
                             return Err(format!(
                                 "spends immature coinbase (needs {} confirmations)", COINBASE_MATURITY));
                         }
-                        e.amount.as_zents()
-                    } else if let Some(v) = created.get(&op) {
-                        *v
+                        (e.amount.as_zents(), e.address.clone())
+                    } else if let Some((v, a)) = created.get(&op) {
+                        (*v, a.clone())
                     } else {
                         return Err(format!("input not found / already spent: {}:{}", op.tx_hash, op.index));
                     };
+                    // OWNERSHIP: the input's public key must derive to the address
+                    // that owns the output. Without this, a valid signature over an
+                    // ATTACKER's key would let them spend ANYONE's coins.
+                    if Address::from_public_key(&inp.public_key, self.config.network) != owner {
+                        return Err(format!("input {}:{} not owned by the signing key", op.tx_hash, op.index));
+                    }
                     in_sum = in_sum.saturating_add(val);
                     spent.insert(op);
                 }
@@ -735,8 +848,8 @@ impl ZentraNode {
             // may legitimately spend them.
             let txid = tx.txid();
             for (idx, o) in tx.outputs.iter().enumerate() {
-                if let TxOutput::Standard { amount, .. } = o {
-                    created.insert(OutPoint::new(txid, idx as u32), amount.as_zents());
+                if let TxOutput::Standard { address, amount, .. } = o {
+                    created.insert(OutPoint::new(txid, idx as u32), (amount.as_zents(), address.clone()));
                 }
             }
         }
@@ -760,21 +873,43 @@ impl ZentraNode {
         Ok(())
     }
 
+    /// Accept a block from a peer. If any parent is missing, the block is PARKED
+    /// in the orphan pool and its missing parents are queued for fetching, then
+    /// connected once they arrive (Bitcoin's orphan map / Kaspa's orphan pool).
     pub fn accept_external_block(&self, block: &Block) -> bool {
         let hash = block.hash();
-        // Already known?
         if matches!(self.dag.get_block(&hash), Ok(Some(_))) {
             return false;
         }
-        // Reject blocks whose parents we don't have yet — prevents chain GAPS.
-        // The sync loop delivers blocks in ascending order, so the parent will
-        // already be present for a valid in-order block.
+        // Collect any parents we don't have yet.
+        let mut missing = Vec::new();
         for parent in &block.header.parents {
             if !matches!(self.dag.get_block(parent), Ok(Some(_))) {
-                tracing::debug!(height = block.header.blue_score, "deferring block — parent not yet present");
-                return false;
+                missing.push(*parent);
             }
         }
+        if !missing.is_empty() {
+            // Park the orphan and remember which parents to fetch. The dialer
+            // will request them by hash; once present, try_connect_orphans wires
+            // this block in. Cap the pool so a flood can't exhaust memory.
+            {
+                let mut orphans = self.orphans.lock();
+                if orphans.len() < 10_000 { orphans.insert(hash, block.clone()); }
+            }
+            let mut w = self.wanted.lock();
+            for m in missing { w.insert(m); }
+            tracing::debug!(height = block.header.blue_score, "parked orphan — requesting parents");
+            return false;
+        }
+        let connected = self.connect_block(block);
+        if connected { self.try_connect_orphans(); }
+        connected
+    }
+
+    /// Connect a block whose parents are ALL present: validate, apply, insert.
+    fn connect_block(&self, block: &Block) -> bool {
+        let hash = block.hash();
+        if matches!(self.dag.get_block(&hash), Ok(Some(_))) { return false; }
 
         // FULL consensus validation BEFORE we commit anything. A block that fails
         // here is dropped entirely — it never enters the DAG or the UTXO set.
@@ -824,6 +959,26 @@ impl ZentraNode {
         true
     }
 
+    /// Connect any parked orphans whose parents are now all present, cascading.
+    pub fn try_connect_orphans(&self) {
+        loop {
+            let ready: Vec<Block> = {
+                let orphans = self.orphans.lock();
+                orphans.values()
+                    .filter(|b| b.header.parents.iter()
+                        .all(|p| matches!(self.dag.get_block(p), Ok(Some(_)))))
+                    .cloned().collect()
+            };
+            if ready.is_empty() { break; }
+            for b in ready {
+                let h = b.hash();
+                self.orphans.lock().remove(&h);
+                self.wanted.lock().remove(&h);
+                self.connect_block(&b);
+            }
+        }
+    }
+
     /// Snapshot of current mempool transactions (for P2P relay).
     pub fn mempool_snapshot(&self) -> Vec<zentra_core::transaction::Transaction> {
         self.mempool.get_transactions_for_block(1000)
@@ -853,6 +1008,10 @@ impl ZentraNode {
                     if e.is_coinbase && cur_h < e.block_height.saturating_add(COINBASE_MATURITY) {
                         return false; // spends immature coinbase — would never validate
                     }
+                    // Ownership: the signing key must own the output being spent.
+                    if Address::from_public_key(&inp.public_key, self.config.network) != e.address {
+                        return false;
+                    }
                     in_sum = in_sum.saturating_add(e.amount.as_zents());
                 }
                 None => return false, // we don't have the input — can't validate/mine it
@@ -865,6 +1024,7 @@ impl ZentraNode {
         }).sum();
         if out_sum > in_sum { return false; }
         let fee = in_sum - out_sum;
+        if fee < MIN_RELAY_FEE_ZENTS { return false; } // reject dust / zero-fee flood
         self.mempool.add_transaction(tx, Amount::from_zents(fee)).is_ok()
     }
 
@@ -873,22 +1033,27 @@ impl ZentraNode {
     /// the oldest slice (not the newest) guarantees a syncing peer can insert
     /// them in order and make progress every round, even across big gaps.
     pub fn blocks_above(&self, from_height: u64, limit: usize) -> Vec<Block> {
-        let mut all: Vec<Block> = Vec::new();
-        let mut cur = self.dag.get_selected_tip().ok().flatten();
-        while let Some(h) = cur {
-            match self.dag.get_block(&h) {
-                Ok(Some(b)) => {
-                    if b.header.blue_score <= from_height { break; }
-                    let parent = b.header.parents.first().copied();
-                    all.push(b);
-                    cur = parent;
-                }
-                _ => break,
+        use std::collections::{HashSet, VecDeque};
+        // BFS from ALL tips over EVERY parent — not just the first-parent chain —
+        // so side/merge blocks travel too. A receiver that only got the
+        // first-parent chain would stall the moment a block referenced a side
+        // parent it never received. (This is the DAG equivalent of Bitcoin
+        // serving every ancestor a peer is missing.)
+        let mut seen: HashSet<Hash> = HashSet::new();
+        let mut collected: Vec<Block> = Vec::new();
+        let mut q: VecDeque<Hash> = self.dag.get_tips().into_iter().collect();
+        while let Some(h) = q.pop_front() {
+            if !seen.insert(h) { continue; }
+            if let Ok(Some(b)) = self.dag.get_block(&h) {
+                if b.header.blue_score <= from_height { continue; }
+                for p in &b.header.parents { if !seen.contains(p) { q.push_back(*p); } }
+                collected.push(b);
             }
         }
-        all.reverse();          // ascending: oldest first
-        all.truncate(limit);    // keep the oldest `limit` above from_height
-        all
+        // Ascending by blue_score so a receiver can connect parents-first.
+        collected.sort_by_key(|b| b.header.blue_score);
+        collected.truncate(limit);
+        collected
     }
 }
 

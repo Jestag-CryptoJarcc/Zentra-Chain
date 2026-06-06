@@ -32,8 +32,9 @@ use std::time::Duration;
 use serde_json::json;
 use tracing::{info, debug};
 use crate::node::{ZentraNode, PeerMinerStat};
+use zentra_types::Hash;
 
-const MAX_FRAME: usize = 64 * 1024 * 1024; // 64 MB safety cap
+const MAX_FRAME: usize = 4 * 1024 * 1024; // 4 MB safety cap (a block is < 1 MB)
 const SYNC_BATCH: usize = 500;
 
 /// Baked-in seed nodes that a freshly-downloaded wallet auto-connects to.
@@ -95,6 +96,12 @@ fn decode_tx(hexs: &str) -> Option<zentra_core::transaction::Transaction> {
 
 // ── listener (server) ────────────────────────────────────────────────────────
 
+/// Hard ceiling on simultaneous inbound P2P connections. Without it a single
+/// host can open thousands of sockets and exhaust our threads/memory (a trivial
+/// DoS). Bitcoin caps inbound peers the same way (-maxconnections).
+const MAX_INBOUND: usize = 256;
+static INBOUND_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Start the inbound P2P listener. Serves block requests and accepts announces.
 pub fn start_listener(node: Arc<ZentraNode>, port: u16) {
     std::thread::spawn(move || {
@@ -106,11 +113,20 @@ pub fn start_listener(node: Arc<ZentraNode>, port: u16) {
         for stream in listener.incoming() {
             match stream {
                 Ok(s) => {
+                    use std::sync::atomic::Ordering;
+                    // Reject once we're at the inbound ceiling. fetch_add returns
+                    // the PRIOR value, so >= MAX means this one is over the line.
+                    if INBOUND_COUNT.fetch_add(1, Ordering::SeqCst) >= MAX_INBOUND {
+                        INBOUND_COUNT.fetch_sub(1, Ordering::SeqCst);
+                        drop(s); // close immediately
+                        continue;
+                    }
                     let node = Arc::clone(&node);
                     std::thread::spawn(move || {
                         if let Err(e) = handle_inbound(node, s) {
                             debug!(err = %e, "inbound peer closed");
                         }
+                        INBOUND_COUNT.fetch_sub(1, Ordering::SeqCst);
                     });
                 }
                 Err(e) => debug!(err = %e, "accept failed"),
@@ -147,6 +163,17 @@ fn handle_inbound(node: Arc<ZentraNode>, mut s: TcpStream) -> std::io::Result<()
                 let hexes: Vec<String> = blocks.iter().map(encode_block).collect();
                 send_json(&mut s, &json!({"t":"blocks","blocks":hexes}))?;
             }
+            // Fetch a single block by hash — used to pull missing parents of an
+            // orphan (Bitcoin's getdata MSG_BLOCK / Kaspa's missing-ancestor req).
+            "getblock" => {
+                let blk = msg["hash"].as_str()
+                    .and_then(|hx| Hash::from_hex(hx).ok())
+                    .and_then(|h| node.dag.get_block(&h).ok().flatten());
+                match blk {
+                    Some(b) => send_json(&mut s, &json!({"t":"block","block":encode_block(&b)}))?,
+                    None => send_json(&mut s, &json!({"t":"block","block":serde_json::Value::Null}))?,
+                }
+            }
             "newblock" => {
                 if let Some(b) = msg["block"].as_str().and_then(decode_block) {
                     node.accept_external_block(&b);
@@ -158,11 +185,16 @@ fn handle_inbound(node: Arc<ZentraNode>, mut s: TcpStream) -> std::io::Result<()
             "addrs" => {
                 if let Some(arr) = msg["addrs"].as_array() {
                     let mut mp = node.manual_peers.lock();
+                    // Hard cap the peer table so gossip can't grow it without
+                    // bound (a flooding peer could otherwise feed us endless
+                    // junk addresses). Bitcoin bounds its addrman the same way.
+                    const MAX_PEERS: usize = 256;
+                    let room = MAX_PEERS.saturating_sub(mp.len());
                     let added: Vec<String> = arr.iter()
                         .filter_map(|v| v.as_str())
                         .filter(|a| !a.is_empty() && a.contains(':') && !mp.contains(&a.to_string()))
                         .map(|a| a.to_string())
-                        .take(50) // cap to avoid abuse
+                        .take(50.min(room)) // cap per-message AND overall table size
                         .collect();
                     for a in &added { mp.push(a.clone()); }
                     if !added.is_empty() {
@@ -288,6 +320,9 @@ fn sync_from_peer(node: &Arc<ZentraNode>, addr: &str) -> std::io::Result<()> {
     // how a public seed node gets the full chain from miners behind NAT: the
     // miner always initiates the connection, so it pushes its blocks here.
     let peer_height = hello["height"].as_u64().unwrap_or(0);
+    // Track the highest chain a peer has — the miner uses this to avoid mining
+    // a competing fork while we're still behind.
+    node.max_peer_height.fetch_max(peer_height, std::sync::atomic::Ordering::Relaxed);
     let mut our_height = node.current_height();
     if our_height > peer_height {
         let mut from = peer_height;
@@ -370,6 +405,34 @@ fn sync_from_peer(node: &Arc<ZentraNode>, addr: &str) -> std::io::Result<()> {
         // If the peer sent a partial-but-no-progress batch, stop to avoid looping.
         if accepted == 0 { break; }
         if arr.len() < SYNC_BATCH { break; }
+    }
+
+    // ── Orphan-parent resolution ───────────────────────────────────────────
+    // When the in-order pull delivers a DAG side-block whose parents we don't
+    // hold yet, accept_external_block parks it as an orphan and records the
+    // missing parent hashes in `node.wanted`. Here we drain that set: request
+    // each missing block by hash (getblock), feed it back in — which connects
+    // the orphan and may cascade — and repeat until nothing more is wanted.
+    // This is Bitcoin's getdata-by-hash / Kaspa's missing-ancestor fetch, and
+    // it lets our DAG hold BOTH branches of a fork and select the heavier tip
+    // WITHOUT re-pulling the whole chain from genesis.
+    for _round in 0..SYNC_BATCH {
+        let want: Vec<Hash> = { node.wanted.lock().iter().copied().collect() };
+        if want.is_empty() { break; }
+        let mut got_any = false;
+        for h in want {
+            send_json(&mut s, &json!({"t":"getblock","hash":h.to_hex()}))?;
+            let resp = recv_json(&mut s)?;
+            if let Some(b) = resp["block"].as_str().and_then(decode_block) {
+                node.accept_external_block(&b);
+                got_any = true;
+            } else {
+                // Peer doesn't have it either — stop asking for this one.
+                node.wanted.lock().remove(&h);
+            }
+        }
+        node.try_connect_orphans();
+        if !got_any { break; }
     }
 
     // ── Transaction relay ──────────────────────────────────────────────────

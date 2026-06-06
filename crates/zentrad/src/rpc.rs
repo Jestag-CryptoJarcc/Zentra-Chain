@@ -306,22 +306,36 @@ impl ZentraRpcServer for RpcServer {
         tx.verify_signatures()
             .map_err(map_rpc_err)?;
 
-        let mut inputs_sum = 0;
+        let mut inputs_sum = 0u64;
         {
             let utxos = self.node.utxo_set.lock();
             for input in &tx.inputs {
                 let outpoint = zentra_core::transaction::OutPoint::new(input.prev_tx_hash, input.output_index);
-                if let Some(entry) = utxos.get_utxo(&outpoint) {
-                    inputs_sum += entry.amount.as_zents();
+                let entry = utxos.get_utxo(&outpoint).ok_or_else(|| {
+                    map_rpc_err(format!("input not found / already spent: {}:{}",
+                        input.prev_tx_hash, input.output_index))
+                })?;
+                // OWNERSHIP: the spending key must derive to the address that owns
+                // the UTXO. Same rule as block validation — a valid signature over
+                // an attacker's own key must NOT spend someone else's coins.
+                if Address::from_public_key(&input.public_key, self.node.config.network) != entry.address {
+                    return Err(map_rpc_err(format!(
+                        "input {}:{} not owned by the signing key",
+                        input.prev_tx_hash, input.output_index)));
                 }
+                inputs_sum = inputs_sum.saturating_add(entry.amount.as_zents());
             }
         }
         let outputs_sum = tx.total_output_amount().as_zents();
-        let fee = if inputs_sum >= outputs_sum {
-            inputs_sum - outputs_sum
-        } else {
-            0
-        };
+        if outputs_sum > inputs_sum {
+            return Err(map_rpc_err(format!(
+                "outputs {} exceed inputs {}", outputs_sum, inputs_sum)));
+        }
+        let fee = inputs_sum - outputs_sum;
+        if fee < crate::node::MIN_RELAY_FEE_ZENTS {
+            return Err(map_rpc_err(format!(
+                "fee {} below minimum relay fee {}", fee, crate::node::MIN_RELAY_FEE_ZENTS)));
+        }
 
         self.node.mempool.add_transaction(tx, Amount::from_zents(fee))
             .map_err(map_rpc_err)?;
@@ -1472,20 +1486,18 @@ pub async fn start_rpc_server(
     node: Arc<ZentraNode>,
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
 ) -> anyhow::Result<()> {
-    let cors = tower_http::cors::CorsLayer::new()
-        .allow_origin(tower_http::cors::Any)
-        .allow_methods(tower_http::cors::Any)
-        .allow_headers(tower_http::cors::Any);
-
-    let middleware = tower::ServiceBuilder::new().layer(cors);
-
+    // NO permissive CORS here. This is the PRIVATE RPC, bound to localhost and
+    // exposing privileged methods (mining control, pool keys, shutdown). A
+    // wildcard Access-Control-Allow-Origin would let any web page the user
+    // visits drive these methods via the browser (DNS-rebinding / CSRF). The
+    // local wallet and CLI are not browsers, so they need no CORS at all. The
+    // public read-only API (port 16112, in main.rs) keeps its own allowlist+CORS.
     let server = ServerBuilder::default()
-        .set_http_middleware(middleware)
         .build(format!("127.0.0.1:{}", port))
         .await?;
 
     let addr = server.local_addr()?;
-    tracing::info!(addr = %addr, "JSON-RPC server started with CORS");
+    tracing::info!(addr = %addr, "private JSON-RPC server started (localhost, no CORS)");
 
     let rpc_impl = RpcServer { node, shutdown_tx };
     let handle = server.start(rpc_impl.into_rpc());

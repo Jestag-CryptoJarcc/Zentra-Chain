@@ -10,8 +10,9 @@ use crate::transaction::Transaction;
 pub struct Mempool {
     /// Transactions indexed by txid
     transactions: DashMap<Hash, MempoolEntry>,
-    /// Priority index: fee_rate (reversed for max-first) → txid
-    priority_index: RwLock<BTreeMap<std::cmp::Reverse<u64>, Hash>>,
+    /// Priority index keyed by (reversed fee_rate, txid) so transactions that
+    /// share a fee rate do NOT collide/evict each other in the map.
+    priority_index: RwLock<BTreeMap<(std::cmp::Reverse<u64>, Hash), ()>>,
     /// Maximum number of transactions
     max_size: usize,
 }
@@ -66,7 +67,7 @@ impl Mempool {
         };
 
         self.transactions.insert(txid, entry);
-        self.priority_index.write().insert(std::cmp::Reverse(fee_rate), txid);
+        self.priority_index.write().insert((std::cmp::Reverse(fee_rate), txid), ());
 
         tracing::debug!(txid = %txid, fee_rate, "transaction added to mempool");
         Ok(())
@@ -75,7 +76,7 @@ impl Mempool {
     /// Remove a transaction by txid.
     pub fn remove_transaction(&self, txid: &Hash) -> Option<Transaction> {
         if let Some((_, entry)) = self.transactions.remove(txid) {
-            self.priority_index.write().retain(|_, v| v != txid);
+            self.priority_index.write().retain(|(_, v), _| v != txid);
             Some(entry.transaction)
         } else {
             None
@@ -86,9 +87,9 @@ impl Mempool {
     pub fn get_transactions_for_block(&self, max_count: usize) -> Vec<Transaction> {
         let priority = self.priority_index.read();
         priority
-            .values()
+            .keys()
             .take(max_count)
-            .filter_map(|txid| self.transactions.get(txid).map(|e| e.transaction.clone()))
+            .filter_map(|(_, txid)| self.transactions.get(txid).map(|e| e.transaction.clone()))
             .collect()
     }
 

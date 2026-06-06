@@ -56,6 +56,11 @@ struct Cli {
     #[arg(long)]
     connect: Vec<String>,
 
+    /// Do NOT auto-connect to the baked-in seed nodes. Use for an isolated
+    /// local devnet or testing, where you only want --connect / peers.txt peers.
+    #[arg(long)]
+    no_seeds: bool,
+
     /// Number of mining threads (default: physical core count). Use 1 for a VPS.
     #[arg(long)]
     mine_threads: Option<usize>,
@@ -169,8 +174,11 @@ async fn main() {
     // ── P2P peers: load from peers.txt + --connect flags, then start sync ──
     {
         let mut peers: Vec<String> = Vec::new();
-        // 1. Baked-in seed nodes (auto-connect for downloaded wallets)
-        for s in p2p_sync::DEFAULT_SEED_PEERS { peers.push(s.to_string()); }
+        // 1. Baked-in seed nodes (auto-connect for downloaded wallets), unless
+        //    --no-seeds was passed for an isolated local devnet / test.
+        if !cli.no_seeds {
+            for s in p2p_sync::DEFAULT_SEED_PEERS { peers.push(s.to_string()); }
+        }
         // 2. peers.txt in the data dir (one host:port per line, # = comment)
         let peers_file = node.config.data_dir.join("peers.txt");
         if let Ok(txt) = std::fs::read_to_string(&peers_file) {
@@ -231,6 +239,84 @@ async fn main() {
 
 /// Forward a JSON-RPC request body to the private local RPC and return the
 /// response body. Used by the public website's same-origin `/rpc` proxy.
+// ── Public faucet rate-limiter ──────────────────────────────────────────────
+// The faucet is the ONE state-mutating method we still expose publicly, so it
+// needs its own throttle or a script drains it instantly. Three independent
+// limits, mirroring how real faucets defend themselves:
+//   • per-IP cooldown  — one claim per IP every 6h
+//   • global min-gap   — at most one claim every 3s across ALL callers
+//   • daily cap        — a hard ceiling of claims per UTC day
+const FAUCET_IP_COOLDOWN_MS: u64 = 6 * 60 * 60 * 1000;
+const FAUCET_GLOBAL_GAP_MS: u64 = 3_000;
+const FAUCET_DAILY_CAP: u32 = 500;
+
+struct FaucetLimiter {
+    per_ip: std::collections::HashMap<String, u64>,
+    last_global_ms: u64,
+    day: u64,
+    today_count: u32,
+}
+
+static FAUCET_LIMITER: std::sync::LazyLock<std::sync::Mutex<FaucetLimiter>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(FaucetLimiter {
+        per_ip: std::collections::HashMap::new(),
+        last_global_ms: 0,
+        day: 0,
+        today_count: 0,
+    }));
+
+fn now_ms_wall() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Decide whether `ip` may claim from the faucet right now. On success the
+/// claim is recorded (counters advance) so the caller MUST forward the claim.
+fn faucet_allow(ip: &str) -> Result<(), &'static str> {
+    let now = now_ms_wall();
+    let mut l = FAUCET_LIMITER.lock().unwrap_or_else(|e| e.into_inner());
+    let day = now / 86_400_000;
+    if day != l.day { l.day = day; l.today_count = 0; }
+    if l.today_count >= FAUCET_DAILY_CAP { return Err("faucet daily limit reached, try tomorrow"); }
+    if now.saturating_sub(l.last_global_ms) < FAUCET_GLOBAL_GAP_MS {
+        return Err("faucet busy, try again in a few seconds");
+    }
+    if let Some(&last) = l.per_ip.get(ip) {
+        if now.saturating_sub(last) < FAUCET_IP_COOLDOWN_MS {
+            return Err("this IP already claimed recently — one claim per 6 hours");
+        }
+    }
+    // Bound memory: drop stale entries once the map grows large.
+    if l.per_ip.len() > 100_000 {
+        l.per_ip.retain(|_, &mut t| now.saturating_sub(t) < FAUCET_IP_COOLDOWN_MS);
+    }
+    l.per_ip.insert(ip.to_string(), now);
+    l.last_global_ms = now;
+    l.today_count += 1;
+    Ok(())
+}
+
+/// Best-effort client IP: prefer the proxy-supplied original IP (Cloudflare /
+/// nginx) over the socket peer, which behind a reverse proxy is just 127.0.0.1.
+fn client_ip(req: &str, peer: std::net::SocketAddr) -> String {
+    for line in req.lines() {
+        let ll = line.to_ascii_lowercase();
+        if let Some(v) = ll.strip_prefix("cf-connecting-ip:") {
+            let v = v.trim();
+            if !v.is_empty() { return v.to_string(); }
+        }
+        if let Some(v) = ll.strip_prefix("x-forwarded-for:") {
+            if let Some(first) = v.split(',').next() {
+                let first = first.trim();
+                if !first.is_empty() { return first.to_string(); }
+            }
+        }
+    }
+    peer.ip().to_string()
+}
+
 async fn forward_rpc(rpc_port: u16, body: &str) -> Option<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = tokio::net::TcpStream::connect(("127.0.0.1", rpc_port)).await.ok()?;
@@ -256,7 +342,7 @@ async fn start_web_server(port: u16) -> anyhow::Result<()> {
 
     loop {
         match listener.accept().await {
-            Ok((mut socket, _)) => {
+            Ok((mut socket, peer_addr)) => {
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     // Read the full request: keep reading until we have the
@@ -304,6 +390,13 @@ async fn start_web_server(port: u16) -> anyhow::Result<()> {
                         let method = serde_json::from_str::<serde_json::Value>(body).ok()
                             .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|s| s.to_string()))
                             .unwrap_or_default();
+                        // PUBLIC allowlist = READ-ONLY chain/network/pool data +
+                        // the rate-limited faucet. The pool WRITE methods
+                        // (poolJoin / poolHeartbeat) are deliberately NOT here:
+                        // exposing them let any remote caller register fake miners
+                        // and inflate their share weight to steal pool payouts.
+                        // Pool participation is tracked from real P2P miner stats
+                        // instead; poolJoin/poolHeartbeat stay on the private RPC.
                         const ALLOWED: &[&str] = &[
                             // chain · blocks · transactions · addresses (read-only)
                             "getDagInfo", "getRecentBlocks", "getBlockByHash", "getBlockDetail",
@@ -313,17 +406,25 @@ async fn start_web_server(port: u16) -> anyhow::Result<()> {
                             "getNetworkInfo", "getMiningStatus", "getMiningInfo",
                             // AMM
                             "getPoolState",
-                            // mining pool
+                            // mining pool (read-only views)
                             "poolGetInfo", "poolGetMiners", "poolGetPayouts",
-                            "poolJoin", "poolHeartbeat",
-                            // faucet
+                            // faucet (faucetClaim is rate-limited below)
                             "faucetInfo", "faucetClaim",
                         ];
-                        let out = if ALLOWED.contains(&method.as_str()) {
+                        let out = if !ALLOWED.contains(&method.as_str()) {
+                            "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32601,\"message\":\"method not allowed via public API\"},\"id\":null}".to_string()
+                        } else if method == "faucetClaim" {
+                            // Throttle BEFORE forwarding so abuse never reaches the node.
+                            let ip = client_ip(req, peer_addr);
+                            match faucet_allow(&ip) {
+                                Ok(()) => forward_rpc(port - 1, body).await.unwrap_or_else(||
+                                    "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"node unavailable\"},\"id\":null}".to_string()),
+                                Err(reason) => format!(
+                                    "{{\"jsonrpc\":\"2.0\",\"error\":{{\"code\":-32005,\"message\":\"{}\"}},\"id\":null}}", reason),
+                            }
+                        } else {
                             forward_rpc(port - 1, body).await.unwrap_or_else(||
                                 "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"node unavailable\"},\"id\":null}".to_string())
-                        } else {
-                            "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32601,\"message\":\"method not allowed via public API\"},\"id\":null}".to_string()
                         };
                         let _ = socket.write_all(format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
