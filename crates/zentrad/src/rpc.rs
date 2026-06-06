@@ -346,7 +346,10 @@ impl ZentraRpcServer for RpcServer {
     async fn get_balance(&self, address_str: String) -> RpcResult<u64> {
         let address = Address::from_bech32(&address_str)
             .map_err(map_rpc_err)?;
-        let balance = self.node.utxo_set.lock().get_balance(&address);
+        // Spendable balance only — excludes coinbase that hasn't matured yet, so
+        // the figure shown always matches what can actually be sent.
+        let h = self.node.current_height();
+        let balance = self.node.utxo_set.lock().get_spendable_balance(&address, h);
         Ok(balance.as_zents())
     }
 
@@ -555,7 +558,10 @@ impl ZentraRpcServer for RpcServer {
         let to_address = Address::from_bech32(&to_address_str)
             .map_err(map_rpc_err)?;
 
-        let utxos = self.node.utxo_set.lock().get_utxos_for_address(&from_address);
+        // Only spend MATURE outputs — selecting an immature coinbase would build
+        // a transaction every miner rejects, leaving it stuck in the mempool.
+        let cur_h = self.node.current_height();
+        let utxos = self.node.utxo_set.lock().get_spendable_utxos_for_address(&from_address, cur_h);
         let total_needed = amount_zents + fee_zents;
         let mut selected = Vec::new();
         let mut accumulated = 0;
@@ -1430,7 +1436,8 @@ impl ZentraRpcServer for RpcServer {
         let kp = master.derive_keypair(0, 0);
         let faucet_addr = Address::from_bech32(&self.node.faucet_address).map_err(map_rpc_err)?;
 
-        let utxos = self.node.utxo_set.lock().get_utxos_for_address(&faucet_addr);
+        let cur_h = self.node.current_height();
+        let utxos = self.node.utxo_set.lock().get_spendable_utxos_for_address(&faucet_addr, cur_h);
         let needed = FAUCET_CLAIM_ZENTS + FAUCET_FEE_ZENTS;
         let mut selected = Vec::new();
         let mut acc = 0u64;

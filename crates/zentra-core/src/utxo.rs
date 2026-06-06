@@ -12,6 +12,10 @@ use zentra_types::*;
 use crate::transaction::{Transaction, TxOutput, OutPoint};
 use crate::block::Block;
 
+/// Blocks a coinbase output must age before it can be spent (Bitcoin-style).
+/// Mirrors the value enforced in block validation and mining selection.
+pub const COINBASE_MATURITY: u64 = 10;
+
 /// A single unspent transaction output entry.
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
 pub struct UtxoEntry {
@@ -97,7 +101,8 @@ impl UtxoSet {
         Ok(())
     }
 
-    /// Get the balance for an address (sum of all UTXOs).
+    /// Get the balance for an address (sum of ALL UTXOs, including immature
+    /// coinbase). Prefer `get_spendable_balance` for anything user-facing.
     pub fn get_balance(&self, address: &Address) -> Amount {
         self.utxos
             .values()
@@ -105,12 +110,37 @@ impl UtxoSet {
             .fold(Amount::ZERO, |acc, entry| acc.saturating_add(entry.amount))
     }
 
-    /// Get all UTXOs belonging to an address.
+    /// Spendable balance at `current_height`: excludes coinbase outputs that
+    /// haven't reached COINBASE_MATURITY. This is what a wallet should show and
+    /// spend — counting immature coinbase lets you build a transaction that
+    /// every miner rejects (the coins aren't spendable yet), which then sits
+    /// stuck in the mempool. Excluding it at the source prevents that.
+    pub fn get_spendable_balance(&self, address: &Address, current_height: u64) -> Amount {
+        self.utxos
+            .values()
+            .filter(|e| e.address == *address)
+            .filter(|e| !e.is_coinbase || current_height >= e.block_height.saturating_add(COINBASE_MATURITY))
+            .fold(Amount::ZERO, |acc, e| acc.saturating_add(e.amount))
+    }
+
+    /// Get all UTXOs belonging to an address (including immature coinbase).
     pub fn get_utxos_for_address(&self, address: &Address) -> Vec<(OutPoint, UtxoEntry)> {
         self.utxos
             .iter()
             .filter(|(_, entry)| entry.address == *address)
             .map(|(op, entry)| (op.clone(), entry.clone()))
+            .collect()
+    }
+
+    /// Only the UTXOs that can actually be spent at `current_height` — mature
+    /// coinbase + all regular outputs. Transaction building must use this so it
+    /// never selects an immature coinbase as an input.
+    pub fn get_spendable_utxos_for_address(&self, address: &Address, current_height: u64) -> Vec<(OutPoint, UtxoEntry)> {
+        self.utxos
+            .iter()
+            .filter(|(_, e)| e.address == *address)
+            .filter(|(_, e)| !e.is_coinbase || current_height >= e.block_height.saturating_add(COINBASE_MATURITY))
+            .map(|(op, e)| (op.clone(), e.clone()))
             .collect()
     }
 

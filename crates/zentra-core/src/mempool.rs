@@ -115,6 +115,29 @@ impl Mempool {
         }
     }
 
+    /// Evict transactions older than `max_age_ms`. A valid transaction is mined
+    /// within a couple of blocks; anything still sitting here long after that is
+    /// stuck — typically rejected by miners (e.g. it spends an output that never
+    /// confirmed) — and would otherwise clog the mempool forever. Returns how
+    /// many were dropped.
+    pub fn evict_older_than(&self, max_age_ms: u64) -> usize {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let stale: Vec<Hash> = self.transactions.iter()
+            .filter(|e| now.saturating_sub(e.value().added_at) > max_age_ms)
+            .map(|e| *e.key())
+            .collect();
+        for txid in &stale {
+            self.remove_transaction(txid);
+        }
+        if !stale.is_empty() {
+            tracing::info!(count = stale.len(), "evicted stuck transactions from mempool");
+        }
+        stale.len()
+    }
+
     /// Clear all transactions from the mempool.
     pub fn clear(&self) {
         self.transactions.clear();

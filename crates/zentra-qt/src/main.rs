@@ -258,6 +258,10 @@ enum Tab {
 
 struct NodeState {
     connected: bool,
+    /// Consecutive failed polls — we only show "Not connected" after a few in a
+    /// row, so a single transient RPC hiccup (e.g. the node briefly busy mining)
+    /// doesn't flicker the status while we're clearly synced.
+    poll_failures: u32,
     blue_score: u64,
     tips_count: usize,
     selected_tip: String,
@@ -300,6 +304,7 @@ impl Default for NodeState {
     fn default() -> Self {
         Self {
             connected: false,
+            poll_failures: 0,
             blue_score: 0,
             tips_count: 0,
             selected_tip: "—".into(),
@@ -3814,6 +3819,7 @@ fn fmt_amount(v: f64) -> String {
 fn call_rpc(method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
     let body = json!({ "jsonrpc": "2.0", "method": method, "params": params, "id": 1 });
     let resp = ureq::post("http://127.0.0.1:16111")
+        .timeout(std::time::Duration::from_secs(8))
         .set("Content-Type", "application/json")
         .send_json(body)
         .map_err(|e| e.to_string())?;
@@ -3828,8 +3834,15 @@ fn call_rpc(method: &str, params: serde_json::Value) -> Result<serde_json::Value
 
 fn poll_node(state: &Arc<Mutex<NodeState>>) {
     let dag = match call_rpc("getDagInfo", json!([])) {
-        Ok(r) => r,
-        Err(_) => { state.lock().unwrap().connected = false; return; }
+        Ok(r) => { state.lock().unwrap().poll_failures = 0; r }
+        Err(_) => {
+            // Only declare a real disconnect after several consecutive misses;
+            // a lone failed poll while the node is busy must not flip the status.
+            let mut s = state.lock().unwrap();
+            s.poll_failures = s.poll_failures.saturating_add(1);
+            if s.poll_failures >= 3 { s.connected = false; }
+            return;
+        }
     };
     let pool    = call_rpc("getPoolState",    json!([])).unwrap_or(json!({}));
     let mining  = call_rpc("getMiningStatus", json!([])).unwrap_or(json!({}));

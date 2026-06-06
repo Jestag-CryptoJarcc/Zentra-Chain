@@ -390,13 +390,14 @@ async fn start_web_server(port: u16) -> anyhow::Result<()> {
                         let method = serde_json::from_str::<serde_json::Value>(body).ok()
                             .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|s| s.to_string()))
                             .unwrap_or_default();
-                        // PUBLIC allowlist = READ-ONLY chain/network/pool data +
-                        // the rate-limited faucet. The pool WRITE methods
-                        // (poolJoin / poolHeartbeat) are deliberately NOT here:
-                        // exposing them let any remote caller register fake miners
-                        // and inflate their share weight to steal pool payouts.
-                        // Pool participation is tracked from real P2P miner stats
-                        // instead; poolJoin/poolHeartbeat stay on the private RPC.
+                        // PUBLIC allowlist = READ-ONLY chain/network/pool data,
+                        // the rate-limited faucet, and pool registration.
+                        // NOTE: poolJoin/poolHeartbeat let a miner register and
+                        // report its hashrate so the operator can split rewards.
+                        // Self-reported hashrate is trust-based (a caller could
+                        // overstate it to inflate its share) — fine for this
+                        // devnet pool; before mainnet, share weight should come
+                        // from verified P2P stats / submitted shares instead.
                         const ALLOWED: &[&str] = &[
                             // chain · blocks · transactions · addresses (read-only)
                             "getDagInfo", "getRecentBlocks", "getBlockByHash", "getBlockDetail",
@@ -406,8 +407,9 @@ async fn start_web_server(port: u16) -> anyhow::Result<()> {
                             "getNetworkInfo", "getMiningStatus", "getMiningInfo",
                             // AMM
                             "getPoolState",
-                            // mining pool (read-only views)
+                            // mining pool (views + registration)
                             "poolGetInfo", "poolGetMiners", "poolGetPayouts",
+                            "poolJoin", "poolHeartbeat",
                             // faucet (faucetClaim is rate-limited below)
                             "faucetInfo", "faucetClaim",
                         ];

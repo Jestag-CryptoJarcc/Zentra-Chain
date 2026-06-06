@@ -250,9 +250,15 @@ fn handle_inbound(node: Arc<ZentraNode>, mut s: TcpStream) -> std::io::Result<()
 
 /// Start the outbound dialer. Periodically syncs from every configured peer.
 pub fn start_dialer(node: Arc<ZentraNode>) {
+    // A transaction that hasn't been mined within this window is stuck (rejected
+    // by miners — e.g. it chains off an output that never confirmed) and is
+    // dropped so it can't clog the mempool forever. Runs on EVERY node, mining
+    // or not, so a relay-only seed clears its mempool too.
+    const MEMPOOL_EXPIRY_MS: u64 = 20 * 60 * 1000; // 20 minutes
     std::thread::spawn(move || {
         info!("P2P dialer started");
         loop {
+            node.mempool.evict_older_than(MEMPOOL_EXPIRY_MS);
             let peers = node.manual_peers.lock().clone();
             for addr in peers {
                 let n = Arc::clone(&node);
