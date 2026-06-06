@@ -7902,6 +7902,7 @@ dependencies = [
  "libp2p",
  "num_cpus",
  "parking_lot",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

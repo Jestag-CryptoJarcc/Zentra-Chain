@@ -309,6 +309,7 @@ impl ZentraRpcServer for RpcServer {
         let mut inputs_sum = 0u64;
         {
             let utxos = self.node.utxo_set.lock();
+            let current_height = self.node.current_height();
             for input in &tx.inputs {
                 let outpoint = zentra_core::transaction::OutPoint::new(input.prev_tx_hash, input.output_index);
                 let entry = utxos.get_utxo(&outpoint).ok_or_else(|| {
@@ -323,6 +324,16 @@ impl ZentraRpcServer for RpcServer {
                         "input {}:{} not owned by the signing key",
                         input.prev_tx_hash, input.output_index)));
                 }
+                
+                // COINBASE MATURITY: Spends of coinbase outputs are locked until they mature
+                const COINBASE_MATURITY: u64 = 10;
+                if entry.is_coinbase && current_height < entry.block_height.saturating_add(COINBASE_MATURITY) {
+                    return Err(map_rpc_err(format!(
+                        "spends immature coinbase {}:{} (needs {} confirmations, current height {})",
+                        input.prev_tx_hash, input.output_index, COINBASE_MATURITY, current_height
+                    )));
+                }
+
                 inputs_sum = inputs_sum.saturating_add(entry.amount.as_zents());
             }
         }
@@ -735,13 +746,22 @@ impl ZentraRpcServer for RpcServer {
         let network = self.node.config.network;
 
         // Current tip for confirmation count
-        let tip_score = self.node.dag.get_selected_tip().ok().flatten()
+        let selected_tip = self.node.dag.get_selected_tip().ok().flatten();
+        let tip_score = selected_tip
             .and_then(|tip| self.node.dag.get_header(&tip).ok().flatten())
             .map(|h| h.blue_score)
             .unwrap_or(0);
 
+        let selected_chain: std::collections::HashSet<Hash> = if let Some(tip) = selected_tip {
+            self.node.get_selected_chain(tip).into_iter().collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
         let history = self.node.block_history.lock();
         let blocks_json: Vec<serde_json::Value> = history.iter().map(|block| {
+            let hash = block.hash();
+            let is_selected = selected_chain.contains(&hash);
             let txs: Vec<serde_json::Value> = block.transactions.iter().map(|tx| {
                 // Derive sender address from public_key in each input
                 let inputs_json: Vec<serde_json::Value> = tx.inputs.iter().map(|i| {
@@ -786,7 +806,7 @@ impl ZentraRpcServer for RpcServer {
             let confirmations = tip_score.saturating_sub(block.header.blue_score) + 1;
 
             serde_json::json!({
-                "hash": block.hash().to_hex(),
+                "hash": hash.to_hex(),
                 "version": block.header.version,
                 "parents": block.header.parents.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
                 "merkle_root": block.header.merkle_root.to_hex(),
@@ -796,6 +816,7 @@ impl ZentraRpcServer for RpcServer {
                 "bits": block.header.bits,
                 "blue_score": block.header.blue_score,
                 "confirmations": confirmations,
+                "is_selected": is_selected,
                 "transactions": txs,
             })
         }).collect();
@@ -1487,24 +1508,90 @@ impl ZentraRpcServer for RpcServer {
     }
 }
 
+use tower::{Layer, Service};
+use std::task::{Context, Poll};
+use hyper::{Request, Response, StatusCode};
+use std::future::Future;
+use std::pin::Pin;
+
+#[derive(Clone)]
+pub struct AuthLayer {
+    token: String,
+}
+
+impl<S> Layer<S> for AuthLayer {
+    type Service = AuthService<S>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        AuthService {
+            inner,
+            token: self.token.clone(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct AuthService<S> {
+    inner: S,
+    token: String,
+}
+
+impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for AuthService<S>
+where
+    S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    ReqBody: Send + 'static,
+    ResBody: Default + Send + 'static,
+{
+    type Response = Response<ResBody>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
+        let auth_header = req.headers().get("authorization")
+            .and_then(|h| h.to_str().ok());
+        
+        let expected_auth = format!("Bearer {}", self.token);
+        if auth_header == Some(expected_auth.as_str()) {
+            let mut inner = self.inner.clone();
+            Box::pin(async move {
+                inner.call(req).await
+            })
+        } else {
+            Box::pin(async move {
+                let res = Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .body(ResBody::default())
+                    .unwrap();
+                Ok(res)
+            })
+        }
+    }
+}
+
 /// Start the RPC server on the given port.
 pub async fn start_rpc_server(
     port: u16,
     node: Arc<ZentraNode>,
     shutdown_tx: tokio::sync::mpsc::Sender<()>,
 ) -> anyhow::Result<()> {
-    // NO permissive CORS here. This is the PRIVATE RPC, bound to localhost and
-    // exposing privileged methods (mining control, pool keys, shutdown). A
-    // wildcard Access-Control-Allow-Origin would let any web page the user
-    // visits drive these methods via the browser (DNS-rebinding / CSRF). The
-    // local wallet and CLI are not browsers, so they need no CORS at all. The
-    // public read-only API (port 16112, in main.rs) keeps its own allowlist+CORS.
+    // Read the RPC auth token from the data directory
+    let token_path = node.config.data_dir.join("rpc_auth.token");
+    let token = std::fs::read_to_string(&token_path)
+        .map(|t| t.trim().to_string())
+        .unwrap_or_else(|_| "invalid_token".to_string());
+
     let server = ServerBuilder::default()
+        .set_http_middleware(tower::ServiceBuilder::new().layer(AuthLayer { token }))
         .build(format!("127.0.0.1:{}", port))
         .await?;
 
     let addr = server.local_addr()?;
-    tracing::info!(addr = %addr, "private JSON-RPC server started (localhost, no CORS)");
+    tracing::info!(addr = %addr, "private JSON-RPC server started (localhost, with token auth)");
 
     let rpc_impl = RpcServer { node, shutdown_tx };
     let handle = server.start(rpc_impl.into_rpc());

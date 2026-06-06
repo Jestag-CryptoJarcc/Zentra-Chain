@@ -216,6 +216,26 @@ fn print_usage() {
     println!("  vaultwithdraw <address> <amount_zusd>       Simulate zUSD burn to withdraw to Ethereum");
 }
 
+fn read_rpc_token() -> String {
+    let paths = vec![
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|dir| dir.join("zentra-data").join("rpc_auth.token"))),
+        Some(std::path::PathBuf::from("./zentra-data/rpc_auth.token")),
+    ];
+
+    for path_opt in paths {
+        if let Some(path) = path_opt {
+            if path.exists() {
+                if let Ok(token) = std::fs::read_to_string(&path) {
+                    return token.trim().to_string();
+                }
+            }
+        }
+    }
+    String::new()
+}
+
 fn send_rpc(method: &str, params: serde_json::Value) -> Result<serde_json::Value, anyhow::Error> {
     let mut stream = TcpStream::connect("127.0.0.1:16111")
         .map_err(|_| anyhow::anyhow!("Could not connect to zentrad daemon at 127.0.0.1:16111. Make sure the daemon is running!"))?;
@@ -227,14 +247,17 @@ fn send_rpc(method: &str, params: serde_json::Value) -> Result<serde_json::Value
         "id": 1
     });
     
+    let token = read_rpc_token();
     let body = serde_json::to_string(&payload)?;
     let request = format!(
         "POST / HTTP/1.1\r\n\
          Host: 127.0.0.1:16111\r\n\
+         Authorization: Bearer {}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\r\n\
          {}",
+        token,
         body.len(),
         body
     );

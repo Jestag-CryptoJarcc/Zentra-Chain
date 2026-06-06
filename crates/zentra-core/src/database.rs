@@ -8,7 +8,7 @@ use zentra_types::*;
 use crate::header::Header;
 use crate::block::Block;
 use crate::transaction::OutPoint;
-use crate::utxo::UtxoEntry;
+use crate::utxo::{UtxoEntry, BlockUndoData};
 
 /// Column family names for logical data separation.
 const CF_HEADERS: &str = "headers";
@@ -174,6 +174,44 @@ impl ZentraDb {
                 Ok(children)
             }
             Ok(None) => Ok(vec![]),
+            Err(e) => Err(ZentraError::Database(e.to_string())),
+        }
+    }
+
+    // --- GhostDAG raw operations ---
+
+    pub fn put_ghostdag_raw(&self, hash: &Hash, value: &[u8]) -> ZentraResult<()> {
+        let cf = self.db.cf_handle(CF_GHOSTDAG).ok_or_else(|| ZentraError::Database("missing CF".into()))?;
+        self.db.put_cf(&cf, hash.as_bytes(), value)
+            .map_err(|e| ZentraError::Database(e.to_string()))
+    }
+
+    pub fn get_ghostdag_raw(&self, hash: &Hash) -> ZentraResult<Option<Vec<u8>>> {
+        let cf = self.db.cf_handle(CF_GHOSTDAG).ok_or_else(|| ZentraError::Database("missing CF".into()))?;
+        self.db.get_cf(&cf, hash.as_bytes())
+            .map_err(|e| ZentraError::Database(e.to_string()))
+    }
+
+    // --- Undo operations ---
+
+    pub fn put_undo(&self, hash: &Hash, undo: &BlockUndoData) -> ZentraResult<()> {
+        let cf = self.db.cf_handle(CF_METADATA).ok_or_else(|| ZentraError::Database("missing CF".into()))?;
+        let key = format!("undo:{}", hash.to_hex());
+        let value = borsh::to_vec(undo).map_err(|e| ZentraError::Serialization(e.to_string()))?;
+        self.db.put_cf(&cf, key.as_bytes(), &value)
+            .map_err(|e| ZentraError::Database(e.to_string()))
+    }
+
+    pub fn get_undo(&self, hash: &Hash) -> ZentraResult<Option<BlockUndoData>> {
+        let cf = self.db.cf_handle(CF_METADATA).ok_or_else(|| ZentraError::Database("missing CF".into()))?;
+        let key = format!("undo:{}", hash.to_hex());
+        match self.db.get_cf(&cf, key.as_bytes()) {
+            Ok(Some(data)) => {
+                let undo = BlockUndoData::try_from_slice(&data)
+                    .map_err(|e| ZentraError::Serialization(e.to_string()))?;
+                Ok(Some(undo))
+            }
+            Ok(None) => Ok(None),
             Err(e) => Err(ZentraError::Database(e.to_string())),
         }
     }

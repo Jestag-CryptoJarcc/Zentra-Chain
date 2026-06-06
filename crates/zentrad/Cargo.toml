@@ -19,6 +19,7 @@ zentra-wallet = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 borsh = { workspace = true }
+rand = { workspace = true }
 thiserror = { workspace = true }
 ed25519-dalek = { workspace = true }
 tracing = { workspace = true }

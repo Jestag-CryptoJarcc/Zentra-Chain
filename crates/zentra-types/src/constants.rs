@@ -166,7 +166,10 @@ impl NetworkType {
     /// Devnet mines faster in wall-clock time because difficulty is low,
     /// but halvings happen at the same block heights as mainnet.
     pub fn halving_interval(&self) -> u64 {
-        HALVING_INTERVAL_BLOCKS
+        match self {
+            NetworkType::Devnet => 1000,
+            _ => HALVING_INTERVAL_BLOCKS,
+        }
     }
 }
 

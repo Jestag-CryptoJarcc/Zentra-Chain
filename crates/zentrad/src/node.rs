@@ -59,6 +59,7 @@ pub struct ZentraNode {
 
     // Dynamic mining state
     pub is_mining: Arc<AtomicBool>,
+    pub is_syncing: Arc<AtomicBool>,
     pub miner_lane: Arc<AtomicU8>,
     pub miner_threads: Arc<AtomicU8>,
     pub miner_address: Arc<parking_lot::Mutex<Option<Address>>>,
@@ -226,20 +227,14 @@ impl ZentraNode {
             (phrase, addr)
         };
 
-        // The pool ADDRESS is always the single shared pool wallet, so every
-        // miner on every node pools into the same pot. The local `pool_mnemonic`
-        // (from this node's pool_wallet.txt) only matters for the operator: a
-        // node can pay the pool out only if its seed derives to this address,
-        // which is true exactly on the VPS that holds the real pool seed.
-        let shared_pool_address = crate::pool::DEFAULT_POOL_ADDRESS.to_string();
-        let is_pool_operator = pool_address == shared_pool_address;
-        let mut pool_inner = MiningPool::new(pool_mnemonic, shared_pool_address.clone());
+        // The pool address is derived from the operator's local pool seed.
+        // This allows anyone to run their own pool on their own seed.
+        let mut pool_inner = MiningPool::new(pool_mnemonic, pool_address.clone());
         // Load a previously-saved operator fee address, if any.
         if let Ok(op) = std::fs::read_to_string(config.data_dir.join("pool_operator.txt")) {
             let op = op.trim().to_string();
             if !op.is_empty() { pool_inner.operator_address = op; }
         }
-        let _ = is_pool_operator; // (informational; payout is guarded at spend time)
         let pool = Arc::new(parking_lot::Mutex::new(pool_inner));
         let pool_mode = Arc::new(AtomicBool::new(false));
 
@@ -264,6 +259,7 @@ impl ZentraNode {
             encrypted_mempool: Arc::new(parking_lot::Mutex::new(encrypted_mempool)),
             block_history,
             is_mining,
+            is_syncing: Arc::new(AtomicBool::new(false)),
             miner_lane,
             miner_threads,
             miner_address,
@@ -305,11 +301,8 @@ impl ZentraNode {
             info!("Background mining worker thread spawned");
             loop {
                 if self_clone.is_mining.load(std::sync::atomic::Ordering::Relaxed) {
-                    // Don't mine our own fork while a peer is well ahead — sync
-                    // the existing chain first. This is what prevents two nodes
-                    // from each mining a competing branch from the same genesis.
-                    let peer_h = self_clone.max_peer_height.load(std::sync::atomic::Ordering::Relaxed);
-                    if peer_h > self_clone.current_height().saturating_add(3) {
+                    // Don't mine while we are actively syncing blocks from a peer.
+                    if self_clone.is_syncing.load(std::sync::atomic::Ordering::Relaxed) {
                         std::thread::sleep(std::time::Duration::from_millis(500));
                         continue;
                     }
@@ -407,54 +400,17 @@ impl ZentraNode {
                     let found = miner.mine_block(&mut template, threads);
 
                     if found {
-                        // Self-check our own block through the SAME consensus gate
-                        // peers will use. If a race made it invalid (e.g. a tx we
-                        // included was just spent by an incoming block), drop it
-                        // instead of mining an invalid block onto the chain.
-                        if let Err(e) = self_clone.validate_full_block(&template) {
-                            tracing::warn!(err = %e, "discarding self-mined block — failed validation");
+                        if self_clone.connect_block(&template) {
+                            self_clone.mined_blocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            crate::p2p_sync::broadcast_block(&self_clone, &template);
+                            info!(
+                                height = template.header.blue_score,
+                                hash = %template.hash(),
+                                txs = template.transaction_count(),
+                                "Mined new block!"
+                            );
                         } else {
-                            // Apply to the UTXO set FIRST; only commit to the DAG
-                            // if that succeeds, so the two never diverge.
-                            let utxo_ok = self_clone.utxo_set.lock().apply_block(&template, height).is_ok();
-                            if !utxo_ok {
-                                tracing::error!("self-mined block failed UTXO apply — discarded");
-                            } else if let Err(e) = self_clone.dag.insert_block(&template) {
-                                tracing::error!(err = %e, "Failed to insert mined block into DAG");
-                            } else {
-                                // Record block in difficulty manager to adjust mining speed
-                                self_clone.difficulty.lock().record_block(
-                                    template.header.lane_id,
-                                    template.header.timestamp,
-                                    template.header.bits,
-                                );
-                                // Success! Clean mempool
-                                let txids: Vec<Hash> = template.transactions.iter().map(|t| t.txid()).collect();
-                                self_clone.mempool.remove_confirmed(&txids);
-
-                                // Add to block history
-                                let mut history = self_clone.block_history.lock();
-                                history.push(template.clone());
-                                if history.len() > 100 {
-                                    history.remove(0);
-                                }
-                                self_clone.mined_blocks.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                                // Credit the pool if mining in pool-operator mode.
-                                if self_clone.pool_mode.load(std::sync::atomic::Ordering::Relaxed) {
-                                    self_clone.pool.lock().blocks_found += 1;
-                                }
-
-                                // Announce the new block to all peers for fast propagation.
-                                crate::p2p_sync::broadcast_block(&self_clone, &template);
-
-                                info!(
-                                    height,
-                                    hash = %template.hash(),
-                                    txs = template.transaction_count(),
-                                    "Mined new block!"
-                                );
-                            }
+                            tracing::error!("self-mined block failed to connect");
                         }
                     }
                     // Low-power keep-alive throttle: nap after each attempt so a
@@ -699,44 +655,116 @@ impl ZentraNode {
     ///     this same block) and is spent at most once across the whole block
     ///  6. signatures verify; outputs never exceed inputs (fee = inputs−outputs ≥ 0)
     ///  7. the coinbase pays at most subsidy(height) + total fees — never more
-    pub fn validate_full_block(&self, block: &Block) -> Result<(), String> {
-        use std::collections::{HashMap, HashSet};
-        use zentra_core::transaction::{OutPoint, TxOutput};
+    pub fn get_selected_chain(&self, start: Hash) -> Vec<Hash> {
+        use borsh::BorshDeserialize;
+        let mut chain = Vec::new();
+        let mut current = start;
+        while current != Hash::ZERO {
+            chain.push(current);
+            if let Ok(Some(bytes)) = self.dag.get_ghostdag_raw(&current) {
+                if let Ok(data) = zentra_consensus::ghostdag::GhostdagData::try_from_slice(&bytes) {
+                    current = data.selected_parent;
+                    continue;
+                }
+            }
+            if let Ok(Some(header)) = self.dag.get_header(&current) {
+                if let Some(p) = header.parents.first() {
+                    current = *p;
+                } else {
+                    current = Hash::ZERO;
+                }
+            } else {
+                break;
+            }
+        }
+        chain
+    }
 
-        // 1. structure
-        block.validate_basic().map_err(|e| format!("structure: {e}"))?;
+    pub fn calculate_expected_difficulty(&self, parents: &[Hash], lane_id: LaneId) -> Result<u32, String> {
+        use borsh::BorshDeserialize;
+        let mut engine = zentra_consensus::difficulty::DifficultyEngine::new_with_network(lane_id, self.config.network);
 
-        // 2. proof-of-work
-        zentra_consensus::lanes::verify_block_pow(&block.header)
-            .map_err(|e| format!("pow: {e}"))?;
-
-        // 2b. difficulty floor — the claimed target may not be EASIER than the
-        // network minimum. (Full retarget-window validation is required before
-        // mainnet; this floor blocks the trivial "mine at easiest bits" abuse.)
-        let floor_target = Header::target_from_bits(Header::easiest_bits());
-        let block_target = Header::target_from_bits(block.header.bits);
-        if block_target > floor_target {
-            return Err("difficulty easier than the network floor".into());
+        // Find the heaviest parent to walk back along
+        let mut selected_parent = Hash::ZERO;
+        let mut max_score = 0;
+        for p in parents {
+            if let Ok(Some(h)) = self.dag.get_header(p) {
+                if h.blue_score >= max_score {
+                    max_score = h.blue_score;
+                    selected_parent = *p;
+                }
+            }
         }
 
-        // 2c. timestamp may not be too far in the future (anti time-warp).
+        if selected_parent == Hash::ZERO {
+            // Genesis region
+            return Ok(zentra_consensus::difficulty::DifficultyEngine::genesis_difficulty());
+        }
+
+        // Walk back from selected_parent to collect up to 20 blocks in this lane
+        let mut history = Vec::new();
+        let mut current = selected_parent;
+
+        while current != Hash::ZERO && history.len() < 20 {
+            if let Ok(Some(header)) = self.dag.get_header(&current) {
+                if header.lane_id == lane_id {
+                    history.push((header.timestamp, header.bits));
+                }
+                // Walk back selected parent from ghostdag
+                if let Ok(Some(bytes)) = self.dag.get_ghostdag_raw(&current) {
+                    if let Ok(data) = zentra_consensus::ghostdag::GhostdagData::try_from_slice(&bytes) {
+                        current = data.selected_parent;
+                        continue;
+                    }
+                }
+                // Fallback
+                if let Some(p) = header.parents.first() {
+                    current = *p;
+                } else {
+                    current = Hash::ZERO;
+                }
+            } else {
+                break;
+            }
+        }
+
+        // Push into engine in chronological order
+        for (timestamp, bits) in history.into_iter().rev() {
+            engine.record_block(timestamp, bits);
+        }
+
+        Ok(engine.next_difficulty())
+    }
+
+    pub fn validate_block_header(&self, header: &Header) -> Result<(), String> {
+        // structural validation
+        header.validate_basic().map_err(|e| format!("structure: {e}"))?;
+
+        // proof-of-work target checks
+        zentra_consensus::lanes::verify_block_pow(header)
+            .map_err(|e| format!("pow: {e}"))?;
+
+        // timestamp checks (future time)
         const MAX_FUTURE_MS: u64 = 2 * 60 * 60 * 1000; // 2 hours
-        if block.header.timestamp > now_ms().saturating_add(MAX_FUTURE_MS) {
+        if header.timestamp > now_ms().saturating_add(MAX_FUTURE_MS) {
             return Err("block timestamp too far in the future".into());
         }
 
-        // 2d. median-time-past: a block's timestamp must exceed the median of its
-        // last 11 ancestors. Walking the block's OWN parent chain (not global
-        // history) keeps this branch-safe during sync. This is Bitcoin's
-        // GetMedianTimePast rule — it stops a miner dragging timestamps backward
-        // to game difficulty without tripping the future-time cap. We only
-        // enforce it once enough ancestors exist (genesis region is exempt).
+        // difficulty retargeting verification
+        let expected_bits = self.calculate_expected_difficulty(&header.parents, header.lane_id)?;
+        if header.bits != expected_bits {
+            return Err(format!(
+                "difficulty target mismatch: block header has {:#010X}, expected {:#010X}",
+                header.bits, expected_bits
+            ));
+        }
+
+        // median-time-past checks
         {
             let mut times: Vec<u64> = Vec::with_capacity(11);
-            let mut cursor: Vec<Hash> = block.header.parents.clone();
-            let mut visited: HashSet<Hash> = HashSet::new();
+            let mut cursor: Vec<Hash> = header.parents.clone();
+            let mut visited: std::collections::HashSet<Hash> = std::collections::HashSet::new();
             while times.len() < 11 {
-                // pick the heaviest unvisited parent as the chain to walk back
                 let mut next: Option<(Hash, Header)> = None;
                 for p in &cursor {
                     if !visited.contains(p) {
@@ -759,38 +787,27 @@ impl ZentraNode {
             if times.len() >= 11 {
                 times.sort_unstable();
                 let mtp = times[times.len() / 2];
-                if block.header.timestamp <= mtp {
+                if header.timestamp <= mtp {
                     return Err(format!(
                         "block timestamp {} not after median-time-past {}",
-                        block.header.timestamp, mtp));
+                        header.timestamp, mtp));
                 }
             }
         }
 
-        // 3. merkle root
+        Ok(())
+    }
+
+    pub fn validate_block_transactions(&self, block: &Block, utxo: &UtxoSet) -> Result<(), String> {
+        use std::collections::{HashMap, HashSet};
+        use zentra_core::transaction::{OutPoint, TxOutput};
+
+        // Merkle root check
         if !block.validate_merkle_root() {
             return Err("merkle root mismatch".into());
         }
 
-        // 4. blue_score must strictly exceed the heaviest known parent
-        let mut max_parent_score = 0u64;
-        let mut saw_parent = false;
-        for p in &block.header.parents {
-            if let Ok(Some(h)) = self.dag.get_header(p) {
-                saw_parent = true;
-                max_parent_score = max_parent_score.max(h.blue_score);
-            }
-        }
-        if saw_parent && block.header.blue_score <= max_parent_score {
-            return Err(format!(
-                "blue_score {} not greater than parent {}",
-                block.header.blue_score, max_parent_score
-            ));
-        }
         let height = block.header.blue_score;
-
-        // 5/6. per-transaction UTXO + signature + fee checks
-        let utxo = self.utxo_set.lock();
         let mut spent: HashSet<OutPoint> = HashSet::new();
         // outpoint -> (amount, owner address) for outputs created earlier in THIS block
         let mut created: HashMap<OutPoint, (u64, Address)> = HashMap::new();
@@ -809,11 +826,8 @@ impl ZentraNode {
                     if spent.contains(&op) {
                         return Err(format!("double-spend within block: {}:{}", op.tx_hash, op.index));
                     }
-                    // The address that owns the output being spent — used to prove
-                    // the spender actually owns these coins (see ownership check).
+
                     let (val, owner) = if let Some(e) = utxo.get_utxo(&op) {
-                        // Coinbase outputs are locked until they mature, exactly
-                        // like Bitcoin's 100-confirmation coinbase rule.
                         const COINBASE_MATURITY: u64 = 10;
                         if e.is_coinbase && height < e.block_height.saturating_add(COINBASE_MATURITY) {
                             return Err(format!(
@@ -825,9 +839,7 @@ impl ZentraNode {
                     } else {
                         return Err(format!("input not found / already spent: {}:{}", op.tx_hash, op.index));
                     };
-                    // OWNERSHIP: the input's public key must derive to the address
-                    // that owns the output. Without this, a valid signature over an
-                    // ATTACKER's key would let them spend ANYONE's coins.
+
                     if Address::from_public_key(&inp.public_key, self.config.network) != owner {
                         return Err(format!("input {}:{} not owned by the signing key", op.tx_hash, op.index));
                     }
@@ -844,8 +856,7 @@ impl ZentraNode {
                 total_fees = total_fees.saturating_add(in_sum - out_sum);
             }
 
-            // Record this tx's standard outputs so a later tx in the same block
-            // may legitimately spend them.
+            // Record this tx's standard outputs
             let txid = tx.txid();
             for (idx, o) in tx.outputs.iter().enumerate() {
                 if let TxOutput::Standard { address, amount, .. } = o {
@@ -853,9 +864,8 @@ impl ZentraNode {
                 }
             }
         }
-        drop(utxo);
 
-        // 7. coinbase cannot mint more than subsidy + fees
+        // coinbase reward check
         if let Some(cb) = block.transactions.first() {
             if cb.is_coinbase() {
                 let subsidy = self.emission.block_reward(height).as_zents();
@@ -873,15 +883,162 @@ impl ZentraNode {
         Ok(())
     }
 
-    /// Accept a block from a peer. If any parent is missing, the block is PARKED
-    /// in the orphan pool and its missing parents are queued for fetching, then
-    /// connected once they arrive (Bitcoin's orphan map / Kaspa's orphan pool).
+    pub fn validate_full_block(&self, block: &Block) -> Result<(), String> {
+        self.validate_block_header(&block.header)?;
+        let utxo = self.utxo_set.lock();
+        self.validate_block_transactions(block, &utxo)?;
+        Ok(())
+    }
+
+    fn reorganize(&self, old_tip_opt: Option<Hash>, new_tip: Hash) -> Result<(), String> {
+        use borsh::BorshDeserialize;
+        let old_tip = match old_tip_opt {
+            Some(t) => t,
+            None => {
+                let mut utxo = self.utxo_set.lock();
+                let block = self.dag.get_block(&new_tip)
+                    .map_err(|e| format!("database error: {e}"))?
+                    .ok_or_else(|| format!("missing block data for block {new_tip}"))?;
+                self.validate_block_transactions(&block, &utxo)?;
+                let undo = utxo.apply_block(&block, block.header.blue_score)
+                    .map_err(|e| format!("failed to apply block {new_tip}: {e}"))?;
+                self.dag.put_undo(&new_tip, &undo)
+                    .map_err(|e| format!("failed to store undo: {e}"))?;
+                return Ok(());
+            }
+        };
+
+        if old_tip == new_tip {
+            return Ok(());
+        }
+
+        let old_chain = self.get_selected_chain(old_tip);
+        let new_chain = self.get_selected_chain(new_tip);
+
+        let mut common_ancestor = Hash::ZERO;
+        let mut old_idx = None;
+        let mut new_idx = None;
+
+        let old_set: std::collections::HashSet<Hash> = old_chain.iter().copied().collect();
+        for (i, hash) in new_chain.iter().enumerate() {
+            if old_set.contains(hash) {
+                common_ancestor = *hash;
+                new_idx = Some(i);
+                break;
+            }
+        }
+
+        if new_idx.is_some() {
+            for (i, hash) in old_chain.iter().enumerate() {
+                if *hash == common_ancestor {
+                    old_idx = Some(i);
+                    break;
+                }
+            }
+        }
+
+        let to_disconnect = match old_idx {
+            Some(idx) => old_chain[0..idx].to_vec(),
+            None => old_chain,
+        };
+
+        let mut to_connect = match new_idx {
+            Some(idx) => new_chain[0..idx].to_vec(),
+            None => new_chain,
+        };
+        to_connect.reverse();
+
+        let mut utxo = self.utxo_set.lock();
+        let mut disconnected_so_far = Vec::new();
+        let mut connected_so_far = Vec::new();
+        let mut success = true;
+        let mut err_reason = String::new();
+
+        for hash in &to_disconnect {
+            if let Ok(Some(undo)) = self.dag.get_undo(hash) {
+                if let Ok(Some(b)) = self.dag.get_block(hash) {
+                    if let Err(e) = utxo.disconnect_block(&b, &undo) {
+                        success = false;
+                        err_reason = format!("failed to disconnect {hash}: {e}");
+                        break;
+                    }
+                    disconnected_so_far.push(*hash);
+                } else {
+                    success = false;
+                    err_reason = format!("missing block to disconnect: {hash}");
+                    break;
+                }
+            } else {
+                success = false;
+                err_reason = format!("missing undo data to disconnect: {hash}");
+                break;
+            }
+        }
+
+        if success {
+            for hash in &to_connect {
+                if let Ok(Some(b)) = self.dag.get_block(hash) {
+                    if let Err(e) = self.validate_block_transactions(&b, &utxo) {
+                        success = false;
+                        err_reason = format!("transaction validation failed for block {hash}: {e}");
+                        break;
+                    }
+                    match utxo.apply_block(&b, b.header.blue_score) {
+                        Ok(undo) => {
+                            if let Err(e) = self.dag.put_undo(hash, &undo) {
+                                success = false;
+                                err_reason = format!("failed to store undo for block {hash}: {e}");
+                                break;
+                            }
+                            connected_so_far.push(*hash);
+                        }
+                        Err(e) => {
+                            success = false;
+                            err_reason = format!("failed to apply block {hash} to UTXO: {e}");
+                            break;
+                        }
+                    }
+                } else {
+                    success = false;
+                    err_reason = format!("missing block to connect: {hash}");
+                    break;
+                }
+            }
+        }
+
+        if !success {
+            for hash in connected_so_far.iter().rev() {
+                if let Ok(Some(undo)) = self.dag.get_undo(hash) {
+                    if let Ok(Some(b)) = self.dag.get_block(hash) {
+                        let _ = utxo.disconnect_block(&b, &undo);
+                    }
+                }
+            }
+            for hash in disconnected_so_far.iter().rev() {
+                if let Ok(Some(b)) = self.dag.get_block(hash) {
+                    if let Ok(undo) = utxo.apply_block(&b, b.header.blue_score) {
+                        let _ = self.dag.put_undo(hash, &undo);
+                    }
+                }
+            }
+            return Err(err_reason);
+        }
+
+        Ok(())
+    }
+
     pub fn accept_external_block(&self, block: &Block) -> bool {
         let hash = block.hash();
         if matches!(self.dag.get_block(&hash), Ok(Some(_))) {
             return false;
         }
-        // Collect any parents we don't have yet.
+
+        // Basic header PoW check to prevent spamming the orphan pool with zero-PoW garbage
+        if let Err(e) = zentra_consensus::lanes::verify_block_pow(&block.header) {
+            tracing::warn!(hash = %hash, reason = %e, "rejected orphan — invalid PoW");
+            return false;
+        }
+
         let mut missing = Vec::new();
         for parent in &block.header.parents {
             if !matches!(self.dag.get_block(parent), Ok(Some(_))) {
@@ -889,15 +1046,14 @@ impl ZentraNode {
             }
         }
         if !missing.is_empty() {
-            // Park the orphan and remember which parents to fetch. The dialer
-            // will request them by hash; once present, try_connect_orphans wires
-            // this block in. Cap the pool so a flood can't exhaust memory.
             {
                 let mut orphans = self.orphans.lock();
                 if orphans.len() < 10_000 { orphans.insert(hash, block.clone()); }
             }
             let mut w = self.wanted.lock();
-            for m in missing { w.insert(m); }
+            if w.len() < 10_000 {
+                for m in missing { w.insert(m); }
+            }
             tracing::debug!(height = block.header.blue_score, "parked orphan — requesting parents");
             return false;
         }
@@ -906,35 +1062,74 @@ impl ZentraNode {
         connected
     }
 
-    /// Connect a block whose parents are ALL present: validate, apply, insert.
-    fn connect_block(&self, block: &Block) -> bool {
+    pub fn connect_block(&self, block: &Block) -> bool {
+        use borsh::BorshSerialize;
         let hash = block.hash();
         if matches!(self.dag.get_block(&hash), Ok(Some(_))) { return false; }
 
-        // FULL consensus validation BEFORE we commit anything. A block that fails
-        // here is dropped entirely — it never enters the DAG or the UTXO set.
-        if let Err(e) = self.validate_full_block(block) {
-            tracing::warn!(height = block.header.blue_score, hash = %hash, reason = %e, "rejected invalid peer block");
+        // Get old selected tip BEFORE we modify the DAG
+        let old_selected_tip = self.dag.get_selected_tip().ok().flatten();
+
+        if let Err(e) = self.validate_block_header(&block.header) {
+            tracing::warn!(height = block.header.blue_score, hash = %hash, reason = %e, "rejected invalid peer block header");
             return false;
         }
 
-        let height = block.header.blue_score;
-        // Apply to the UTXO set FIRST. If this fails (e.g. a double-spend that
-        // slipped past the read-only check due to a race), we do NOT insert the
-        // block into the DAG, keeping DAG and UTXO state consistent.
-        if let Err(e) = self.utxo_set.lock().apply_block(block, height) {
-            tracing::warn!(err = %e, hash = %hash, "rejected peer block — utxo apply failed");
+        // Compute GhostDAG data
+        let get_ghostdag = |h: &Hash| -> Option<zentra_consensus::ghostdag::GhostdagData> {
+            if let Ok(Some(bytes)) = self.dag.get_ghostdag_raw(h) {
+                borsh::BorshDeserialize::try_from_slice(&bytes).ok()
+            } else {
+                None
+            }
+        };
+        let manager = zentra_consensus::ghostdag::GhostdagManager::default_k();
+        let expected_data = manager.process_block(&hash, &block.header.parents, &get_ghostdag);
+
+        if block.header.blue_score != expected_data.blue_score {
+            tracing::warn!(hash = %hash, "rejected block — blue_score mismatch (header has {}, expected {})", block.header.blue_score, expected_data.blue_score);
             return false;
         }
+        if block.header.blue_work != expected_data.blue_work {
+            tracing::warn!(hash = %hash, "rejected block — blue_work mismatch (header has {}, expected {})", block.header.blue_work, expected_data.blue_work);
+            return false;
+        }
+
         if let Err(e) = self.dag.insert_block(block) {
             tracing::debug!(err = %e, "rejected peer block — dag insert failed");
             return false;
         }
-        self.difficulty.lock().record_block(
-            block.header.lane_id,
-            block.header.timestamp,
-            block.header.bits,
-        );
+
+        if let Ok(bytes) = borsh::to_vec(&expected_data) {
+            let _ = self.dag.put_ghostdag_raw(&hash, &bytes);
+        }
+
+        // Get new selected tip AFTER DAG insertion
+        let new_selected_tip = match self.dag.get_selected_tip() {
+            Ok(Some(t)) => t,
+            _ => hash,
+        };
+
+        // If the tip changed, reorganize
+        if Some(new_selected_tip) != old_selected_tip {
+            if let Err(e) = self.reorganize(old_selected_tip, new_selected_tip) {
+                tracing::warn!(err = %e, hash = %hash, "reorg to new tip failed — block rejected");
+                return false;
+            }
+
+            // Update difficulty manager history from the new selected chain
+            self.rebuild_difficulty_history(new_selected_tip);
+
+            // Interrupt any active mining loop to prevent mining on stale parents
+            if self.is_mining.load(std::sync::atomic::Ordering::Relaxed) {
+                self.is_mining.store(false, std::sync::atomic::Ordering::Relaxed);
+                // Allow a tiny window for mining threads to notice and abort
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                self.is_mining.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        // Success updates (mempool, history, etc.)
         let txids: Vec<Hash> = block.transactions.iter().map(|t| t.txid()).collect();
         self.mempool.remove_confirmed(&txids);
         let mut h = self.block_history.lock();
@@ -942,9 +1137,7 @@ impl ZentraNode {
         if h.len() > 100 { h.remove(0); }
         drop(h);
 
-        // Pool block accounting: if we're the operator and this block's coinbase
-        // paid the shared pool wallet, count it as a pool block (remote miners
-        // find these, so the local mining worker never sees them).
+        // Pool block accounting
         if self.pool_mode.load(std::sync::atomic::Ordering::Relaxed) {
             let pool_addr = self.pool.lock().address.clone();
             let paid_pool = block.transactions.first()
@@ -955,11 +1148,10 @@ impl ZentraNode {
             if paid_pool { self.pool.lock().blocks_found += 1; }
         }
 
-        tracing::info!(height, hash = %hash, "accepted block from peer");
+        tracing::info!(height = block.header.blue_score, hash = %hash, "accepted block");
         true
     }
 
-    /// Connect any parked orphans whose parents are now all present, cascading.
     pub fn try_connect_orphans(&self) {
         loop {
             let ready: Vec<Block> = {
@@ -976,6 +1168,38 @@ impl ZentraNode {
                 self.wanted.lock().remove(&h);
                 self.connect_block(&b);
             }
+        }
+    }
+
+    fn rebuild_difficulty_history(&self, tip_hash: Hash) {
+        use borsh::BorshDeserialize;
+        let mut diff = self.difficulty.lock();
+        diff.clear();
+
+        let mut blocks_to_record = Vec::new();
+        let mut current = tip_hash;
+
+        while current != Hash::ZERO {
+            if let Ok(Some(header)) = self.dag.get_header(&current) {
+                blocks_to_record.push((header.lane_id, header.timestamp, header.bits));
+                if let Ok(Some(bytes)) = self.dag.get_ghostdag_raw(&current) {
+                    if let Ok(data) = zentra_consensus::ghostdag::GhostdagData::try_from_slice(&bytes) {
+                        current = data.selected_parent;
+                        continue;
+                    }
+                }
+                if let Some(p) = header.parents.first() {
+                    current = *p;
+                } else {
+                    current = Hash::ZERO;
+                }
+            } else {
+                break;
+            }
+        }
+
+        for (lane_id, timestamp, bits) in blocks_to_record.into_iter().rev() {
+            diff.record_block(lane_id, timestamp, bits);
         }
     }
 

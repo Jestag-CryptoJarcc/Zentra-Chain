@@ -25,6 +25,18 @@ pub struct UtxoEntry {
     pub is_coinbase: bool,
 }
 
+/// Undo data for a transaction's spent inputs.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+pub struct TxUndoData {
+    pub inputs_undo: Vec<UtxoEntry>,
+}
+
+/// Undo data for all spent inputs in a block's transactions.
+#[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
+pub struct BlockUndoData {
+    pub txs_undo: Vec<TxUndoData>,
+}
+
 /// In-memory UTXO set for fast lookups.
 /// In production, this would be backed by RocksDB via ZentraDb.
 pub struct UtxoSet {
@@ -47,26 +59,28 @@ impl UtxoSet {
     /// - Removes spent UTXOs (inputs)
     /// - Adds new UTXOs from Standard outputs ONLY
     /// - Burn outputs are validated but NOT added (tokens destroyed)
-    pub fn apply_block(&mut self, block: &Block, height: u64) -> ZentraResult<()> {
+    pub fn apply_block(&mut self, block: &Block, height: u64) -> ZentraResult<BlockUndoData> {
+        let mut txs_undo = Vec::new();
         for tx in &block.transactions {
-            self.apply_transaction(tx, height)?;
+            let tx_undo = self.apply_transaction(tx, height)?;
+            txs_undo.push(tx_undo);
         }
-        Ok(())
+        Ok(BlockUndoData { txs_undo })
     }
 
     /// Apply a single transaction to the UTXO set.
-    fn apply_transaction(&mut self, tx: &Transaction, height: u64) -> ZentraResult<()> {
+    fn apply_transaction(&mut self, tx: &Transaction, height: u64) -> ZentraResult<TxUndoData> {
         let txid = tx.txid();
+        let mut inputs_undo = Vec::new();
 
         // Remove spent UTXOs (skip for coinbase — has no inputs)
         if !tx.is_coinbase() {
             for input in &tx.inputs {
                 let outpoint = OutPoint::new(input.prev_tx_hash, input.output_index);
-                if self.utxos.remove(&outpoint).is_none() {
-                    return Err(ZentraError::DoubleSpend(
-                        format!("{}:{}", outpoint.tx_hash, outpoint.index),
-                    ));
-                }
+                let entry = self.utxos.remove(&outpoint).ok_or_else(|| {
+                    ZentraError::DoubleSpend(format!("{}:{}", outpoint.tx_hash, outpoint.index))
+                })?;
+                inputs_undo.push(entry);
             }
         }
 
@@ -95,6 +109,40 @@ impl UtxoSet {
                     );
                     self.total_burned = self.total_burned.saturating_add(*amount);
                 }
+            }
+        }
+
+        Ok(TxUndoData { inputs_undo })
+    }
+
+    /// Rollback/disconnect a block from the UTXO set using its undo data.
+    pub fn disconnect_block(&mut self, block: &Block, undo: &BlockUndoData) -> ZentraResult<()> {
+        if block.transactions.len() != undo.txs_undo.len() {
+            return Err(ZentraError::Database(format!(
+                "block transactions count {} does not match undo data count {}",
+                block.transactions.len(), undo.txs_undo.len()
+            )));
+        }
+
+        // Process transactions in reverse order to undo updates correctly
+        for (tx, tx_undo) in block.transactions.iter().zip(&undo.txs_undo).rev() {
+            let txid = tx.txid();
+
+            // 1. Remove outputs created by this transaction
+            for (idx, output) in tx.outputs.iter().enumerate() {
+                if let TxOutput::Standard { .. } = output {
+                    let outpoint = OutPoint::new(txid, idx as u32);
+                    self.utxos.remove(&outpoint);
+                } else if let TxOutput::Burn { amount, .. } = output {
+                    // Reverse the burn statistic tracking
+                    self.total_burned = self.total_burned.saturating_sub(*amount);
+                }
+            }
+
+            // 2. Restore inputs spent by this transaction
+            for (input, entry) in tx.inputs.iter().zip(&tx_undo.inputs_undo) {
+                let outpoint = OutPoint::new(input.prev_tx_hash, input.output_index);
+                self.utxos.insert(outpoint, entry.clone());
             }
         }
 

@@ -7,6 +7,7 @@ use zentra_types::*;
 use crate::header::Header;
 use crate::block::Block;
 use crate::database::ZentraDb;
+use crate::utxo::BlockUndoData;
 
 /// Thread-safe BlockDAG graph manager with in-memory caches backed by RocksDB.
 pub struct DagGraph {
@@ -37,6 +38,11 @@ impl DagGraph {
 
         // Store the block in the database
         self.db.put_block(&hash, block)?;
+
+        // If genesis (no parents), store genesis GhostDAG data (64 bytes of zero)
+        if block.header.parents.is_empty() {
+            self.db.put_ghostdag_raw(&hash, &vec![0u8; 64])?;
+        }
 
         // Cache the header
         self.header_cache.insert(hash, block.header.clone());
@@ -209,6 +215,22 @@ impl DagGraph {
     /// Get the total number of tips.
     pub fn tip_count(&self) -> usize {
         self.tips.read().len()
+    }
+
+    pub fn get_ghostdag_raw(&self, hash: &Hash) -> ZentraResult<Option<Vec<u8>>> {
+        self.db.get_ghostdag_raw(hash)
+    }
+
+    pub fn put_ghostdag_raw(&self, hash: &Hash, value: &[u8]) -> ZentraResult<()> {
+        self.db.put_ghostdag_raw(hash, value)
+    }
+
+    pub fn get_undo(&self, hash: &Hash) -> ZentraResult<Option<BlockUndoData>> {
+        self.db.get_undo(hash)
+    }
+
+    pub fn put_undo(&self, hash: &Hash, undo: &BlockUndoData) -> ZentraResult<()> {
+        self.db.put_undo(hash, undo)
     }
 }
 

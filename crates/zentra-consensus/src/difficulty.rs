@@ -175,6 +175,13 @@ impl DifficultyManager {
     pub fn engine(&self, lane: LaneId) -> &DifficultyEngine {
         &self.engines[lane.as_u8() as usize]
     }
+
+    /// Clear history of all engines.
+    pub fn clear(&mut self) {
+        for engine in &mut self.engines {
+            engine.history.clear();
+        }
+    }
 }
 
 impl Default for DifficultyManager {

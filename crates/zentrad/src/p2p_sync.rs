@@ -158,8 +158,24 @@ fn handle_inbound(node: Arc<ZentraNode>, mut s: TcpStream) -> std::io::Result<()
                 }))?;
             }
             "getblocks" => {
-                let from = msg["from"].as_u64().unwrap_or(0);
-                let blocks = node.blocks_above(from, SYNC_BATCH);
+                let locator = msg["locator"].as_array();
+                let mut common_height = 0;
+                if let Some(arr) = locator {
+                    for h_val in arr {
+                        if let Some(h_str) = h_val.as_str() {
+                            if let Ok(h) = Hash::from_hex(h_str) {
+                                if let Ok(Some(b)) = node.dag.get_block(&h) {
+                                    common_height = b.header.blue_score;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    common_height = msg["from"].as_u64().unwrap_or(0);
+                }
+
+                let blocks = node.blocks_above(common_height, SYNC_BATCH);
                 let hexes: Vec<String> = blocks.iter().map(encode_block).collect();
                 send_json(&mut s, &json!({"t":"blocks","blocks":hexes}))?;
             }
@@ -393,11 +409,19 @@ fn sync_from_peer(node: &Arc<ZentraNode>, addr: &str) -> std::io::Result<()> {
         }
     }
 
+    node.is_syncing.store(true, std::sync::atomic::Ordering::Relaxed);
+
     // Pull blocks above our height, repeatedly, until we stop making progress.
     loop {
-        let from = node.current_height();
-        send_json(&mut s, &json!({"t":"getblocks","from":from}))?;
-        let resp = recv_json(&mut s)?;
+        let mut locator = Vec::new();
+        if let Ok(Some(tip)) = node.dag.get_selected_tip() {
+            let chain = node.get_selected_chain(tip);
+            for h in chain.into_iter().take(32) {
+                locator.push(h.to_hex());
+            }
+        }
+        if let Err(_) = send_json(&mut s, &json!({"t":"getblocks","locator":locator})) { break; }
+        let resp = match recv_json(&mut s) { Ok(r) => r, Err(_) => break };
         let arr = match resp["blocks"].as_array() { Some(a) => a.clone(), None => break };
         if arr.is_empty() { break; }
 
@@ -408,38 +432,35 @@ fn sync_from_peer(node: &Arc<ZentraNode>, addr: &str) -> std::io::Result<()> {
             }
         }
         debug!(peer = %addr, accepted, "synced batch from peer");
-        // If the peer sent a partial-but-no-progress batch, stop to avoid looping.
         if accepted == 0 { break; }
         if arr.len() < SYNC_BATCH { break; }
     }
 
     // ── Orphan-parent resolution ───────────────────────────────────────────
-    // When the in-order pull delivers a DAG side-block whose parents we don't
-    // hold yet, accept_external_block parks it as an orphan and records the
-    // missing parent hashes in `node.wanted`. Here we drain that set: request
-    // each missing block by hash (getblock), feed it back in — which connects
-    // the orphan and may cascade — and repeat until nothing more is wanted.
-    // This is Bitcoin's getdata-by-hash / Kaspa's missing-ancestor fetch, and
-    // it lets our DAG hold BOTH branches of a fork and select the heavier tip
-    // WITHOUT re-pulling the whole chain from genesis.
     for _round in 0..SYNC_BATCH {
         let want: Vec<Hash> = { node.wanted.lock().iter().copied().collect() };
         if want.is_empty() { break; }
         let mut got_any = false;
         for h in want {
-            send_json(&mut s, &json!({"t":"getblock","hash":h.to_hex()}))?;
-            let resp = recv_json(&mut s)?;
+            if let Err(_) = send_json(&mut s, &json!({"t":"getblock","hash":h.to_hex()})) { continue; }
+            let resp = match recv_json(&mut s) { Ok(r) => r, Err(_) => continue };
             if let Some(b) = resp["block"].as_str().and_then(decode_block) {
-                node.accept_external_block(&b);
-                got_any = true;
+                if b.hash() == h {
+                    node.accept_external_block(&b);
+                    node.wanted.lock().remove(&h);
+                    got_any = true;
+                } else {
+                    node.wanted.lock().remove(&h);
+                }
             } else {
-                // Peer doesn't have it either — stop asking for this one.
                 node.wanted.lock().remove(&h);
             }
         }
         node.try_connect_orphans();
         if !got_any { break; }
     }
+
+    node.is_syncing.store(false, std::sync::atomic::Ordering::Relaxed);
 
     // ── Transaction relay ──────────────────────────────────────────────────
     // Pull the peer's pending transactions into our mempool, then push ours to

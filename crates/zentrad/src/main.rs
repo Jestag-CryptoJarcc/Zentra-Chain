@@ -116,6 +116,20 @@ async fn main() {
                 .unwrap_or_else(|| std::path::PathBuf::from("./zentra-data"))
         });
 
+    // Read or generate the RPC auth token
+    let token_path = data_dir_path.join("rpc_auth.token");
+    let token = if token_path.exists() {
+        std::fs::read_to_string(&token_path).unwrap_or_default().trim().to_string()
+    } else {
+        use rand::RngCore;
+        let mut key = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut key);
+        let hex_token = hex::encode(key);
+        let _ = std::fs::create_dir_all(&data_dir_path);
+        let _ = std::fs::write(&token_path, &hex_token);
+        hex_token
+    };
+
     let config = config::NodeConfig {
         network,
         data_dir: data_dir_path.clone(),
@@ -216,8 +230,9 @@ async fn main() {
 
     // Start Web Dashboard server
     let web_port = rpc_port + 1;
+    let web_token = token.clone();
     tokio::spawn(async move {
-        if let Err(e) = start_web_server(web_port).await {
+        if let Err(e) = start_web_server(web_port, web_token).await {
             tracing::error!(error = %e, "Web dashboard server failed");
         }
     });
@@ -317,12 +332,12 @@ fn client_ip(req: &str, peer: std::net::SocketAddr) -> String {
     peer.ip().to_string()
 }
 
-async fn forward_rpc(rpc_port: u16, body: &str) -> Option<String> {
+async fn forward_rpc(rpc_port: u16, body: &str, token: &str) -> Option<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut s = tokio::net::TcpStream::connect(("127.0.0.1", rpc_port)).await.ok()?;
     let req = format!(
-        "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.as_bytes().len(), body
+        "POST / HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        token, body.as_bytes().len(), body
     );
     s.write_all(req.as_bytes()).await.ok()?;
     let mut resp = Vec::new();
@@ -332,7 +347,7 @@ async fn forward_rpc(rpc_port: u16, body: &str) -> Option<String> {
     Some(text[idx + 4..].to_string())
 }
 
-async fn start_web_server(port: u16) -> anyhow::Result<()> {
+async fn start_web_server(port: u16, token: String) -> anyhow::Result<()> {
     // This is the node's PUBLIC API endpoint, NOT a website host. It exposes a
     // read-only JSON-RPC proxy at /rpc for explorers/sites to read live chain
     // data. The website itself is a separate static bundle, hosted independently
@@ -343,6 +358,7 @@ async fn start_web_server(port: u16) -> anyhow::Result<()> {
     loop {
         match listener.accept().await {
             Ok((mut socket, peer_addr)) => {
+                let token_clone = token.clone();
                 tokio::spawn(async move {
                     use tokio::io::{AsyncReadExt, AsyncWriteExt};
                     // Read the full request: keep reading until we have the
@@ -388,16 +404,10 @@ async fn start_web_server(port: u16) -> anyhow::Result<()> {
                         }
                         let body = req.find("\r\n\r\n").map(|i| &req[i+4..]).unwrap_or("");
                         let method = serde_json::from_str::<serde_json::Value>(body).ok()
-                            .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|s| s.to_string()))
-                            .unwrap_or_default();
+                             .and_then(|v| v.get("method").and_then(|m| m.as_str()).map(|s| s.to_string()))
+                             .unwrap_or_default();
                         // PUBLIC allowlist = READ-ONLY chain/network/pool data,
                         // the rate-limited faucet, and pool registration.
-                        // NOTE: poolJoin/poolHeartbeat let a miner register and
-                        // report its hashrate so the operator can split rewards.
-                        // Self-reported hashrate is trust-based (a caller could
-                        // overstate it to inflate its share) — fine for this
-                        // devnet pool; before mainnet, share weight should come
-                        // from verified P2P stats / submitted shares instead.
                         const ALLOWED: &[&str] = &[
                             // chain · blocks · transactions · addresses (read-only)
                             "getDagInfo", "getRecentBlocks", "getBlockByHash", "getBlockDetail",
@@ -407,7 +417,7 @@ async fn start_web_server(port: u16) -> anyhow::Result<()> {
                             "getNetworkInfo", "getMiningStatus", "getMiningInfo",
                             // AMM
                             "getPoolState",
-                            // mining pool (views + registration)
+                            // mining pool (views & member calls)
                             "poolGetInfo", "poolGetMiners", "poolGetPayouts",
                             "poolJoin", "poolHeartbeat",
                             // faucet (faucetClaim is rate-limited below)
@@ -419,13 +429,13 @@ async fn start_web_server(port: u16) -> anyhow::Result<()> {
                             // Throttle BEFORE forwarding so abuse never reaches the node.
                             let ip = client_ip(req, peer_addr);
                             match faucet_allow(&ip) {
-                                Ok(()) => forward_rpc(port - 1, body).await.unwrap_or_else(||
+                                Ok(()) => forward_rpc(port - 1, body, &token_clone).await.unwrap_or_else(||
                                     "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"node unavailable\"},\"id\":null}".to_string()),
                                 Err(reason) => format!(
                                     "{{\"jsonrpc\":\"2.0\",\"error\":{{\"code\":-32005,\"message\":\"{}\"}},\"id\":null}}", reason),
                             }
                         } else {
-                            forward_rpc(port - 1, body).await.unwrap_or_else(||
+                            forward_rpc(port - 1, body, &token_clone).await.unwrap_or_else(||
                                 "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32603,\"message\":\"node unavailable\"},\"id\":null}".to_string())
                         };
                         let _ = socket.write_all(format!(

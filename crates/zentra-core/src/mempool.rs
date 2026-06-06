@@ -13,6 +13,8 @@ pub struct Mempool {
     /// Priority index keyed by (reversed fee_rate, txid) so transactions that
     /// share a fee rate do NOT collide/evict each other in the map.
     priority_index: RwLock<BTreeMap<(std::cmp::Reverse<u64>, Hash), ()>>,
+    /// Spent outpoints tracked to prevent double spends in the mempool
+    spent_outpoints: DashMap<crate::transaction::OutPoint, Hash>,
     /// Maximum number of transactions
     max_size: usize,
 }
@@ -32,6 +34,7 @@ impl Mempool {
         Mempool {
             transactions: DashMap::new(),
             priority_index: RwLock::new(BTreeMap::new()),
+            spent_outpoints: DashMap::new(),
             max_size,
         }
     }
@@ -52,12 +55,24 @@ impl Mempool {
             ));
         }
 
+        // Verify no inputs are already spent by another transaction in the mempool
+        if !tx.is_coinbase() {
+            for input in &tx.inputs {
+                let op = crate::transaction::OutPoint::new(input.prev_tx_hash, input.output_index);
+                if self.spent_outpoints.contains_key(&op) {
+                    return Err(ZentraError::TransactionValidation(
+                        format!("input already spent by a transaction in the mempool: {}:{}", op.tx_hash, op.index),
+                    ));
+                }
+            }
+        }
+
         // Estimate fee rate (fee per byte)
         let tx_size = borsh::to_vec(&tx).map(|v| v.len() as u64).unwrap_or(1);
         let fee_rate = fee.as_zents() / tx_size.max(1);
 
         let entry = MempoolEntry {
-            transaction: tx,
+            transaction: tx.clone(),
             fee,
             fee_rate,
             added_at: std::time::SystemTime::now()
@@ -65,6 +80,14 @@ impl Mempool {
                 .unwrap_or_default()
                 .as_millis() as u64,
         };
+
+        // Track inputs to prevent double spend
+        if !tx.is_coinbase() {
+            for input in &tx.inputs {
+                let op = crate::transaction::OutPoint::new(input.prev_tx_hash, input.output_index);
+                self.spent_outpoints.insert(op, txid);
+            }
+        }
 
         self.transactions.insert(txid, entry);
         self.priority_index.write().insert((std::cmp::Reverse(fee_rate), txid), ());
@@ -77,6 +100,12 @@ impl Mempool {
     pub fn remove_transaction(&self, txid: &Hash) -> Option<Transaction> {
         if let Some((_, entry)) = self.transactions.remove(txid) {
             self.priority_index.write().retain(|(_, v), _| v != txid);
+            if !entry.transaction.is_coinbase() {
+                for input in &entry.transaction.inputs {
+                    let op = crate::transaction::OutPoint::new(input.prev_tx_hash, input.output_index);
+                    self.spent_outpoints.remove(&op);
+                }
+            }
             Some(entry.transaction)
         } else {
             None
@@ -142,6 +171,7 @@ impl Mempool {
     pub fn clear(&self) {
         self.transactions.clear();
         self.priority_index.write().clear();
+        self.spent_outpoints.clear();
     }
 }
 

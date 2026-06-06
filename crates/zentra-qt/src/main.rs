@@ -1878,6 +1878,7 @@ fn tab_overview(
     let immature: f64 = recent_blocks.iter().map(|block| {
         let confs = block["confirmations"].as_i64().unwrap_or(999);
         if confs >= COINBASE_MATURITY { return 0.0; }
+        if block["is_selected"].as_bool() == Some(false) { return 0.0; }
         block["transactions"].as_array().map(|txs| {
             txs.iter().filter(|tx| tx["type"].as_str() == Some("Coinbase"))
                 .flat_map(|tx| tx["outputs"].as_array().cloned().unwrap_or_default())
@@ -1988,6 +1989,7 @@ fn tab_overview(
             struct TxItem { dir: &'static str, addr: String, amount: f64, height: u64, txid: String, confs: i64 }
             let mut txs: Vec<TxItem> = vec![];
             'outer: for block in recent_blocks.iter().rev() {
+                if block["is_selected"].as_bool() == Some(false) { continue; }
                 let h = block["blue_score"].as_u64().unwrap_or(0);
                 let confs = block["confirmations"].as_i64().unwrap_or(0);
                 if let Some(arr) = block["transactions"].as_array() {
@@ -2391,6 +2393,7 @@ fn tab_transactions(
 
     // Confirmed rows (newest first)
     for block in recent_blocks.iter().rev() {
+        if block["is_selected"].as_bool() == Some(false) { continue; }
         let blk_h = block["blue_score"].as_u64().unwrap_or(0);
         let confs = block["confirmations"].as_i64().unwrap_or(
             (current_height.saturating_sub(blk_h) + 1) as i64
@@ -3816,11 +3819,24 @@ fn fmt_amount(v: f64) -> String {
 
 // ─── RPC ──────────────────────────────────────────────────────────────────────
 
+fn read_rpc_token() -> String {
+    let path = data_dir().join("rpc_auth.token");
+    if path.exists() {
+        if let Ok(token) = std::fs::read_to_string(&path) {
+            return token.trim().to_string();
+        }
+    }
+    String::new()
+}
+
 fn call_rpc(method: &str, params: serde_json::Value) -> Result<serde_json::Value, String> {
     let body = json!({ "jsonrpc": "2.0", "method": method, "params": params, "id": 1 });
+    let token = read_rpc_token();
+    let auth_header = format!("Bearer {}", token);
     let resp = ureq::post("http://127.0.0.1:16111")
         .timeout(std::time::Duration::from_secs(8))
         .set("Content-Type", "application/json")
+        .set("Authorization", &auth_header)
         .send_json(body)
         .map_err(|e| e.to_string())?;
     let j: serde_json::Value = resp.into_json().map_err(|e| e.to_string())?;
