@@ -1284,9 +1284,19 @@ impl ZentraRpcServer for RpcServer {
         let active_miners = pool.active_count().max(learned_miners);
         let learned_hash = *self.node.learned_pool_hashrate.lock();
         let total_hashrate = pool.total_hashrate().max(learned_hash);
+        // Members display the OPERATOR's shared pool wallet (learned over P2P) so
+        // the wallet shows the same pool address as the website/operator.
+        let display_pool_addr = {
+            let op = self.node.learned_operator_pool.lock().clone();
+            if self.node.pool_member.load(std::sync::atomic::Ordering::Relaxed) && !op.is_empty() {
+                op
+            } else {
+                pool.address.clone()
+            }
+        };
         Ok(serde_json::json!({
             "pool_mode": pool_mode,
-            "address": pool.address,
+            "address": display_pool_addr,
             "operator_address": pool.operator_address,
             "fee_bps": crate::pool::POOL_FEE_BPS,
             "fee_percent": crate::pool::POOL_FEE_BPS as f64 / 100.0,
@@ -1308,8 +1318,10 @@ impl ZentraRpcServer for RpcServer {
         Address::from_bech32(&miner_address).map_err(map_rpc_err)?;
         self.node.pool.lock().join(&miner_address);
         // Remember our OWN payout address so P2P stats report it to the operator
-        // (who then credits us, not the shared pool wallet).
+        // (who then credits us, not the shared pool wallet), and switch this node
+        // into pool-MEMBER mode so the miner pays the operator's shared pool wallet.
         *self.node.pool_member_payout.lock() = miner_address.clone();
+        self.node.pool_member.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok("joined".to_string())
     }
 
@@ -1376,6 +1388,8 @@ impl ZentraRpcServer for RpcServer {
 
     async fn pool_set_mode(&self, enabled: bool) -> RpcResult<String> {
         self.node.pool_mode.store(enabled, std::sync::atomic::Ordering::SeqCst);
+        // Disabling pool mode also leaves member mode (back to solo).
+        if !enabled { self.node.pool_member.store(false, std::sync::atomic::Ordering::SeqCst); }
         Ok(if enabled { "pool mode enabled" } else { "pool mode disabled" }.to_string())
     }
 

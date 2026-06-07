@@ -2671,14 +2671,12 @@ fn tab_mining(
                             std::thread::sleep(Duration::from_millis(1500));
                         }
                         if *pool_mining {
-                            let _ = call_rpc("poolSetMode", json!([true]));
+                            // Join as a POOL MEMBER: our node mines into the operator's
+                            // shared pool wallet (learned from the seed over P2P) and the
+                            // operator credits our payout address. We do NOT become our
+                            // own operator, so every pool miner feeds the one VPS pool.
                             let _ = call_rpc("poolJoin", json!([payout_address]));
-                            let target = if pool_addr.is_empty() {
-                                call_rpc("poolGetInfo", json!([])).ok()
-                                    .and_then(|v| v["address"].as_str().map(|s| s.to_string()))
-                                    .unwrap_or_else(|| payout_address.to_string())
-                            } else { pool_addr.to_string() };
-                            match call_rpc("startMining", json!([0u8, target])) {
+                            match call_rpc("startMining", json!([0u8, payout_address])) {
                                 Ok(_)  => *notification = Some(("Pool mining started — earning shares.".into(), false, 4.0)),
                                 Err(e) => *notification = Some((format!("Error: {}", e), true, 6.0)),
                             }

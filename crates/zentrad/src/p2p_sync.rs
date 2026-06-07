@@ -248,12 +248,17 @@ fn handle_inbound(node: Arc<ZentraNode>, mut s: TcpStream) -> std::io::Result<()
                     last_seen_ms: crate::node::now_ms(),
                 };
                 node.apply_peer_stats(stat);
-                // Reply with our own stats so they can see us too.
+                // Reply with our own stats so they can see us too. Include our pool
+                // wallet + operator flag so members can mine into the shared pool.
+                let op_mode = node.pool_mode.load(std::sync::atomic::Ordering::Relaxed);
+                let op_pool = node.pool.lock().address.clone();
                 send_json(&mut s, &json!({
                     "t":"stats_ack",
                     "hashrate": node.combined_network_hashrate(),
                     "peer_count": node.peer_stats.lock().len(),
                     "pool_active_miners": node.pool.lock().active_count(),
+                    "pool_mode": op_mode,
+                    "pool_address": op_pool,
                 }))?;
             }
             // Transaction relay: a peer asks for our pending txs.
@@ -391,7 +396,8 @@ fn sync_from_peer(node: &Arc<ZentraNode>, addr: &str) -> std::io::Result<()> {
     // Broadcast our mining stats so the peer can aggregate them.
     // This is what makes combined network hashrate work across all nodes.
     let is_mining = node.is_mining.load(std::sync::atomic::Ordering::Relaxed);
-    let pool_mining = node.pool_mode.load(std::sync::atomic::Ordering::Relaxed);
+    let pool_mining = node.pool_mode.load(std::sync::atomic::Ordering::Relaxed)
+        || node.pool_member.load(std::sync::atomic::Ordering::Relaxed);
     // Report our OWN payout address when pooling (so the operator credits us, not
     // the pool wallet). Falls back to the miner address for solo.
     let payout_addr = {
@@ -423,6 +429,12 @@ fn sync_from_peer(node: &Arc<ZentraNode>, addr: &str) -> std::io::Result<()> {
             }
             if let Some(h) = ack["hashrate"].as_f64() {
                 *node.learned_pool_hashrate.lock() = h;
+            }
+            // Learn the operator's pool wallet so we (as a member) mine into it.
+            if ack["pool_mode"].as_bool().unwrap_or(false) {
+                if let Some(pa) = ack["pool_address"].as_str() {
+                    if !pa.is_empty() { *node.learned_operator_pool.lock() = pa.to_string(); }
+                }
             }
         }
     }

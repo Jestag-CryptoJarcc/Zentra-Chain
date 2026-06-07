@@ -7744,7 +7744,7 @@ dependencies = [
 
 [[package]]
 name = "zentra-cli"
-version = "0.0.7"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -7753,7 +7753,7 @@ dependencies = [
 
 [[package]]
 name = "zentra-consensus"
-version = "0.0.7"
+version = "0.1.0"
 dependencies = [
  "blake2",
  "borsh",
@@ -7773,7 +7773,7 @@ dependencies = [
 
 [[package]]
 name = "zentra-core"
-version = "0.0.7"
+version = "0.1.0"
 dependencies = [
  "blake2",
  "borsh",
@@ -7794,7 +7794,7 @@ dependencies = [
 
 [[package]]
 name = "zentra-finance"
-version = "0.0.7"
+version = "0.1.0"
 dependencies = [
  "blake2",
  "borsh",
@@ -7813,7 +7813,7 @@ dependencies = [
 
 [[package]]
 name = "zentra-qt"
-version = "0.0.7"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "ed25519-dalek",
@@ -7834,7 +7834,7 @@ dependencies = [
 
 [[package]]
 name = "zentra-runtime"
-version = "0.0.7"
+version = "0.1.0"
 dependencies = [
  "borsh",
  "hex",
@@ -7850,7 +7850,7 @@ dependencies = [
 
 [[package]]
 name = "zentra-types"
-version = "0.0.7"
+version = "0.1.0"
 dependencies = [
  "bech32",
  "blake2",
@@ -7865,7 +7865,7 @@ dependencies = [
 
 [[package]]
 name = "zentra-wallet"
-version = "0.0.7"
+version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -7889,7 +7889,7 @@ dependencies = [
 
 [[package]]
 name = "zentrad"
-version = "0.0.7"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",

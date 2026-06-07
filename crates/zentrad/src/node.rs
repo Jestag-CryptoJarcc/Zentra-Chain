@@ -78,6 +78,13 @@ pub struct ZentraNode {
     /// This miner's OWN payout address when participating in the pool, reported
     /// to the operator over P2P so it credits the right person (not the pool).
     pub pool_member_payout: Arc<parking_lot::Mutex<String>>,
+    /// True when this node mines as a POOL MEMBER into a remote operator's pool
+    /// (as opposed to pool_mode, which means this node IS the operator).
+    pub pool_member: Arc<AtomicBool>,
+    /// The operator's pool wallet address, learned from the seed/operator over
+    /// P2P. A member mines its coinbase to THIS address so every pool block's
+    /// reward lands in the single shared pool wallet.
+    pub learned_operator_pool: Arc<parking_lot::Mutex<String>>,
     /// Pool stats learned from the operator via stats_ack (for member display).
     pub learned_pool_miners: Arc<AtomicU64>,
     pub learned_pool_hashrate: Arc<parking_lot::Mutex<f64>>,
@@ -274,6 +281,8 @@ impl ZentraNode {
             pool,
             pool_mode,
             pool_member_payout: Arc::new(parking_lot::Mutex::new(String::new())),
+            pool_member: Arc::new(AtomicBool::new(false)),
+            learned_operator_pool: Arc::new(parking_lot::Mutex::new(String::new())),
             learned_pool_miners: Arc::new(AtomicU64::new(0)),
             learned_pool_hashrate: Arc::new(parking_lot::Mutex::new(0.0)),
             max_peer_height: Arc::new(AtomicU64::new(0)),
@@ -312,12 +321,21 @@ impl ZentraNode {
                         continue;
                     }
                     let pool_active = self_clone.pool_mode.load(std::sync::atomic::Ordering::Relaxed);
+                    let pool_member = self_clone.pool_member.load(std::sync::atomic::Ordering::Relaxed);
                     let payout_address = if pool_active {
-                        // Pool-operator mode: every block reward goes to the pool wallet.
+                        // Pool-operator mode: every block reward goes to OUR pool wallet.
                         let pool = self_clone.pool.lock();
                         Address::from_bech32(&pool.address).unwrap_or_else(|_| {
                             Address::from_public_key(&[0u8; 32], self_clone.config.network)
                         })
+                    } else if pool_member {
+                        // Pool-member mode: mine into the OPERATOR's shared pool wallet
+                        // (learned from the seed over P2P) so all pool rewards land in
+                        // one wallet. Until it's learned, fall back to our own address.
+                        let op = self_clone.learned_operator_pool.lock().clone();
+                        Address::from_bech32(&op).ok()
+                            .or_else(|| self_clone.miner_address.lock().clone())
+                            .unwrap_or_else(|| Address::from_public_key(&[0u8; 32], self_clone.config.network))
                     } else {
                         let addr_opt = self_clone.miner_address.lock();
                         addr_opt.clone().unwrap_or_else(|| {
