@@ -93,14 +93,14 @@ mod tests {
     #[test]
     fn test_halving() {
         let sched = EmissionSchedule::new(NetworkType::Devnet);
-        // DevNet halving at 1000 blocks
+        // Halving every HALVING_INTERVAL_BLOCKS on ALL networks (no devnet shortcut)
         let reward_0 = sched.block_reward(0).as_zents();
-        let reward_1000 = sched.block_reward(1000).as_zents();
-        let reward_2000 = sched.block_reward(2000).as_zents();
+        let reward_1 = sched.block_reward(HALVING_INTERVAL_BLOCKS).as_zents();
+        let reward_2 = sched.block_reward(HALVING_INTERVAL_BLOCKS * 2).as_zents();
 
         assert_eq!(reward_0, INITIAL_REWARD_ZENTS);
-        assert_eq!(reward_1000, INITIAL_REWARD_ZENTS / 2);
-        assert_eq!(reward_2000, INITIAL_REWARD_ZENTS / 4);
+        assert_eq!(reward_1, INITIAL_REWARD_ZENTS / 2);
+        assert_eq!(reward_2, INITIAL_REWARD_ZENTS / 4);
     }
 
     #[test]
@@ -135,16 +135,16 @@ mod tests {
     fn test_halvings_occurred() {
         let sched = EmissionSchedule::new(NetworkType::Devnet);
         assert_eq!(sched.halvings_occurred(0), 0);
-        assert_eq!(sched.halvings_occurred(999), 0);
-        assert_eq!(sched.halvings_occurred(1000), 1);
-        assert_eq!(sched.halvings_occurred(2500), 2);
+        assert_eq!(sched.halvings_occurred(HALVING_INTERVAL_BLOCKS - 1), 0);
+        assert_eq!(sched.halvings_occurred(HALVING_INTERVAL_BLOCKS), 1);
+        assert_eq!(sched.halvings_occurred(HALVING_INTERVAL_BLOCKS * 2 + 500), 2);
     }
 
     #[test]
     fn test_blocks_until_halving() {
         let sched = EmissionSchedule::new(NetworkType::Devnet);
-        assert_eq!(sched.blocks_until_next_halving(0), 1000);
-        assert_eq!(sched.blocks_until_next_halving(999), 1);
-        assert_eq!(sched.blocks_until_next_halving(1000), 1000);
+        assert_eq!(sched.blocks_until_next_halving(0), HALVING_INTERVAL_BLOCKS);
+        assert_eq!(sched.blocks_until_next_halving(HALVING_INTERVAL_BLOCKS - 1), 1);
+        assert_eq!(sched.blocks_until_next_halving(HALVING_INTERVAL_BLOCKS), HALVING_INTERVAL_BLOCKS);
     }
 }

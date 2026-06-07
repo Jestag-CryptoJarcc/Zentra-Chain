@@ -625,12 +625,16 @@ impl ZentraNode {
     /// Process incoming peer stats: update the stats map and register the peer
     /// as a pool miner if this node is the pool operator.
     pub fn apply_peer_stats(&self, stat: PeerMinerStat) {
-        // NOTE: we deliberately do NOT credit pool shares from a peer's
-        // self-reported P2P stats. Crediting an unverified, attacker-chosen
-        // hashrate let any remote node claim the pool payout. Pool shares are now
-        // only driven by the operator's authenticated private RPC until they are
-        // replaced by verified proof-of-work shares. The stats below are used for
-        // (display-only) network-hashrate aggregation, never for payouts.
+        // Register the peer as a pool miner if we're the operator. Enabled on
+        // devnet/testnet so the single shared pool works end-to-end. On MAINNET
+        // this is disabled (an unverified self-reported hashrate would let a
+        // remote node claim the payout) until verified PoW shares replace it.
+        if !matches!(self.config.network, zentra_types::NetworkType::Mainnet)
+            && self.pool_mode.load(std::sync::atomic::Ordering::Relaxed)
+            && stat.pool_mining && !stat.payout_address.is_empty()
+        {
+            self.pool.lock().heartbeat(&stat.payout_address, stat.hashrate);
+        }
         // Key by a STABLE identity, NOT the ephemeral ip:port. A miner reconnects
         // every few seconds with a new source port; keying by ip:port would make
         // a fresh entry each time and multi-count its hashrate. Prefer the payout

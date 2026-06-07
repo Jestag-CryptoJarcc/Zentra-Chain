@@ -232,7 +232,7 @@ async fn main() {
     let web_port = rpc_port + 1;
     let web_token = token.clone();
     tokio::spawn(async move {
-        if let Err(e) = start_web_server(web_port, web_token).await {
+        if let Err(e) = start_web_server(web_port, web_token, network).await {
             tracing::error!(error = %e, "Web dashboard server failed");
         }
     });
@@ -357,7 +357,7 @@ async fn forward_rpc(rpc_port: u16, body: &str, token: &str) -> Option<String> {
     Some(text[idx + 4..].to_string())
 }
 
-async fn start_web_server(port: u16, token: String) -> anyhow::Result<()> {
+async fn start_web_server(port: u16, token: String, network: zentra_types::NetworkType) -> anyhow::Result<()> {
     // This is the node's PUBLIC API endpoint, NOT a website host. It exposes a
     // read-only JSON-RPC proxy at /rpc for explorers/sites to read live chain
     // data. The website itself is a separate static bundle, hosted independently
@@ -427,18 +427,19 @@ async fn start_web_server(port: u16, token: String) -> anyhow::Result<()> {
                             "getNetworkInfo", "getMiningStatus", "getMiningInfo",
                             // AMM
                             "getPoolState",
-                            // mining pool (READ-ONLY views only). poolJoin /
-                            // poolHeartbeat are intentionally NOT public: they
-                            // credit payout shares from a self-reported hashrate,
-                            // so exposing them unauthenticated let any remote
-                            // attacker claim the whole pool payout. They are now
-                            // private-RPC only (operator-managed) until share
-                            // accounting is replaced with verified PoW shares.
+                            // mining pool views (read-only)
                             "poolGetInfo", "poolGetMiners", "poolGetPayouts",
                             // faucet (faucetClaim is rate-limited below)
                             "faucetInfo", "faucetClaim",
                         ];
-                        let out = if !ALLOWED.contains(&method.as_str()) {
+                        // poolJoin / poolHeartbeat credit payout shares from a
+                        // self-reported hashrate. Allowed publicly on devnet/testnet
+                        // so the single shared pool works end-to-end; BLOCKED on
+                        // mainnet (a remote attacker could otherwise claim the
+                        // payout) until verified PoW shares replace it.
+                        let pool_testing = !matches!(network, zentra_types::NetworkType::Mainnet)
+                            && (method == "poolJoin" || method == "poolHeartbeat");
+                        let out = if !ALLOWED.contains(&method.as_str()) && !pool_testing {
                             "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32601,\"message\":\"method not allowed via public API\"},\"id\":null}".to_string()
                         } else if method == "faucetClaim" {
                             // Throttle BEFORE forwarding so abuse never reaches the node.
