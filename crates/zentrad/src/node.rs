@@ -88,6 +88,16 @@ pub struct ZentraNode {
     /// Pool stats learned from the operator via stats_ack (for member display).
     pub learned_pool_miners: Arc<AtomicU64>,
     pub learned_pool_hashrate: Arc<parking_lot::Mutex<f64>>,
+    /// Whole-network hashrate learned from the seed/operator over P2P. A wallet
+    /// behind NAT never receives other miners' individual stats (no inbound
+    /// connections), so without this its "network total" would only show itself.
+    pub learned_network_hashrate: Arc<parking_lot::Mutex<f64>>,
+    /// Pool shares this (member) node has found and not yet submitted to the
+    /// operator. Each is a full block whose PoW meets the easier share target,
+    /// pays the operator's pool wallet, and is tagged with our payout address.
+    pub pending_shares: Arc<parking_lot::Mutex<Vec<Block>>>,
+    /// Share block hashes the operator has already credited (dedup).
+    pub seen_shares: Arc<parking_lot::Mutex<std::collections::HashSet<Hash>>>,
     /// Highest block height any peer has advertised — the mining worker won't
     /// mine while we are far below this (so a fresh/behind node syncs the
     /// existing chain instead of mining its own competing fork).
@@ -144,13 +154,24 @@ impl ZentraNode {
         let mut utxo_set = UtxoSet::new();
         let mut history = vec![];
 
+        use borsh::BorshDeserialize as _BorshDeser;
+        let ghostdag_of = |h: &Hash| -> Option<zentra_consensus::ghostdag::GhostdagData> {
+            dag.get_ghostdag_raw(h).ok().flatten()
+                .and_then(|b| zentra_consensus::ghostdag::GhostdagData::try_from_slice(&b).ok())
+        };
         let selected_tip = dag.get_selected_tip().ok().flatten();
         let mut path = vec![];
         let mut curr = selected_tip;
         while let Some(hash) = curr {
+            if hash == Hash::ZERO { break; }
             if let Ok(Some(block)) = dag.get_block(&hash) {
-                path.push(block.clone());
-                curr = block.header.parents.first().cloned();
+                // Follow the GhostDAG selected parent (the real selected chain),
+                // falling back to the first header parent if ghostdag is absent.
+                let next = ghostdag_of(&hash).map(|gd| gd.selected_parent)
+                    .filter(|p| *p != Hash::ZERO)
+                    .or_else(|| block.header.parents.first().cloned());
+                path.push(block);
+                curr = next;
             } else {
                 break;
             }
@@ -166,14 +187,25 @@ impl ZentraNode {
             for block in path {
                 let height = block.header.blue_score;
                 let _ = utxo_set.apply_block(&block, height);
-                
+
+                // Re-credit the coinbase of every blue MERGE block this block
+                // brought in, so merge-mined rewards survive a restart (matches
+                // apply_block_with_merges used during live block connection).
+                if let Some(gd) = ghostdag_of(&block.hash()) {
+                    for m in gd.mergeset_blues {
+                        if let Ok(Some(mb)) = dag.get_block(&m) {
+                            let _ = utxo_set.apply_merge_coinbase(&mb, mb.header.blue_score);
+                        }
+                    }
+                }
+
                 // Record block in difficulty manager to restore difficulty tracking state
                 difficulty.lock().record_block(
                     block.header.lane_id,
                     block.header.timestamp,
                     block.header.bits,
                 );
-                
+
                 history.push(block);
             }
         }
@@ -255,6 +287,11 @@ impl ZentraNode {
             "node initialized"
         );
 
+        // Saved pool target (the operator pool a member chose) — read before
+        // `config` is moved into the struct below.
+        let pool_target_saved = std::fs::read_to_string(config.data_dir.join("pool_target.txt")).ok()
+            .map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_default();
+
         Ok(ZentraNode {
             config,
             dag,
@@ -281,10 +318,13 @@ impl ZentraNode {
             pool,
             pool_mode,
             pool_member_payout: Arc::new(parking_lot::Mutex::new(String::new())),
-            pool_member: Arc::new(AtomicBool::new(false)),
-            learned_operator_pool: Arc::new(parking_lot::Mutex::new(String::new())),
+            pool_member: Arc::new(AtomicBool::new(!pool_target_saved.is_empty())),
+            learned_operator_pool: Arc::new(parking_lot::Mutex::new(pool_target_saved.clone())),
             learned_pool_miners: Arc::new(AtomicU64::new(0)),
             learned_pool_hashrate: Arc::new(parking_lot::Mutex::new(0.0)),
+            learned_network_hashrate: Arc::new(parking_lot::Mutex::new(0.0)),
+            pending_shares: Arc::new(parking_lot::Mutex::new(Vec::new())),
+            seen_shares: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
             max_peer_height: Arc::new(AtomicU64::new(0)),
             orphans: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             wanted: Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new())),
@@ -410,11 +450,27 @@ impl ZentraNode {
 
                     let bits = self_clone.difficulty.lock().get_next_difficulty(lane);
 
+                    // Pool-member mining: emit PoW shares (easier target) tagged with
+                    // our payout address, so the operator can verify+credit our work.
+                    let member_tag = if pool_member {
+                        self_clone.pool_member_payout.lock().clone()
+                    } else { String::new() };
+                    let share_sink: Option<std::sync::Arc<std::sync::Mutex<Vec<u64>>>> =
+                        if pool_member && !member_tag.is_empty() {
+                            Some(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+                        } else { None };
+                    let share_target = if share_sink.is_some() {
+                        Some(zentra_consensus::miner::share_target_from_bits(bits))
+                    } else { None };
+
                     let miner = zentra_consensus::miner::Miner {
                         lane,
                         address: payout_address.clone(),
                         is_mining: Arc::clone(&self_clone.is_mining),
                         hashes_done: Some(Arc::clone(&self_clone.mining_hashes)),
+                        share_target,
+                        shares: share_sink.clone(),
+                        coinbase_tag: member_tag.clone().into_bytes(),
                     };
 
                     let mut template = miner.build_block_template(
@@ -443,6 +499,22 @@ impl ZentraNode {
                             );
                         } else {
                             tracing::error!("self-mined block failed to connect");
+                        }
+                    }
+
+                    // Queue any pool shares found while mining this template (each is
+                    // the same template with a share-meeting nonce). The dialer sends
+                    // them to the operator, which verifies the PoW and credits us.
+                    if let Some(sink) = &share_sink {
+                        let nonces: Vec<u64> = sink.lock().map(|mut v| std::mem::take(&mut *v)).unwrap_or_default();
+                        if !nonces.is_empty() {
+                            let mut pend = self_clone.pending_shares.lock();
+                            for n in nonces {
+                                if pend.len() >= 5000 { break; }
+                                let mut share = template.clone();
+                                share.header.nonce = n;
+                                pend.push(share);
+                            }
                         }
                     }
                     // Low-power keep-alive throttle: nap after each attempt so a
@@ -637,7 +709,9 @@ impl ZentraNode {
             .filter(|s| now.saturating_sub(s.last_seen_ms) < 30_000) // only peers seen in last 30s
             .map(|s| s.hashrate)
             .sum();
-        our + peers
+        // Behind NAT we get no inbound peer stats, so fall back to the whole-network
+        // hashrate the seed/operator reported to us (take whichever is larger).
+        (our + peers).max(*self.learned_network_hashrate.lock())
     }
 
     /// Process incoming peer stats: update the stats map and register the peer
@@ -664,6 +738,41 @@ impl ZentraNode {
                 .unwrap_or_else(|| stat.peer_addr.clone())
         };
         self.peer_stats.lock().insert(key, stat);
+    }
+
+    /// Verify a pool SHARE submitted by a member and credit it (operator side).
+    /// A share is a full block whose PoW meets the easier share target, whose
+    /// coinbase pays OUR pool wallet, and whose coinbase payload is tagged with the
+    /// member's payout address. Non-spoofable: the member proved real work, and a
+    /// thief can't claim it because the payout tag is inside the PoW-committed
+    /// block. Returns true if newly credited.
+    pub fn verify_and_credit_share(&self, block: &Block) -> bool {
+        use std::sync::atomic::Ordering;
+        if !self.pool_mode.load(Ordering::Relaxed) { return false; } // only the operator credits
+        let h = block.hash();
+        if self.seen_shares.lock().contains(&h) { return false; } // dedup
+
+        let cb = match block.transactions.first() {
+            Some(t) if t.is_coinbase() => t,
+            _ => return false,
+        };
+        let pool_addr = self.pool.lock().address.clone();
+        let pays_pool = cb.outputs.iter().any(|o| matches!(o,
+            zentra_core::transaction::TxOutput::Standard { address, .. } if address.to_string() == pool_addr));
+        if !pays_pool { return false; }
+        // Member tag = coinbase payload after the 8-byte height prefix (bech32 addr).
+        if cb.payload.len() <= 8 { return false; }
+        let member = match String::from_utf8(cb.payload[8..].to_vec()) { Ok(s) => s, Err(_) => return false };
+        if Address::from_bech32(&member).is_err() { return false; }
+        if !block.validate_merkle_root() { return false; }
+        let share_target = zentra_consensus::miner::share_target_from_bits(block.header.bits);
+        if !zentra_consensus::lanes::pow_meets_target(&block.header, &share_target) { return false; }
+
+        self.pool.lock().add_share(&member);
+        let mut seen = self.seen_shares.lock();
+        seen.insert(h);
+        if seen.len() > 200_000 { seen.clear(); }
+        true
     }
 
     /// Current chain height (blue score of the selected tip).
@@ -963,6 +1072,36 @@ impl ZentraNode {
         Ok(())
     }
 
+    /// GhostDAG blue-merge block hashes recorded for `hash` (empty if none).
+    fn mergeset_blues_of(&self, hash: &Hash) -> Vec<Hash> {
+        use borsh::BorshDeserialize;
+        self.dag.get_ghostdag_raw(hash).ok().flatten()
+            .and_then(|bytes| zentra_consensus::ghostdag::GhostdagData::try_from_slice(&bytes).ok())
+            .map(|gd| gd.mergeset_blues)
+            .unwrap_or_default()
+    }
+
+    /// Apply a selected-chain block to the UTXO set AND pay the coinbase reward of
+    /// every blue MERGE block it brings into the chain. This is the DAG fairness
+    /// rule: every miner who solved a valid block gets paid — not just the one
+    /// whose block won the selected-tip race (Bitcoin orphans the loser; a
+    /// BlockDAG pays it). Returns combined undo so a reorg removes both.
+    fn apply_block_with_merges(
+        &self,
+        utxo: &mut zentra_core::utxo::UtxoSet,
+        block: &Block,
+    ) -> Result<zentra_core::utxo::BlockUndoData, String> {
+        let mut undo = utxo.apply_block(block, block.header.blue_score)
+            .map_err(|e| format!("failed to apply block {}: {e}", block.hash()))?;
+        for m in self.mergeset_blues_of(&block.hash()) {
+            if let Ok(Some(mb)) = self.dag.get_block(&m) {
+                let created = utxo.apply_merge_coinbase(&mb, mb.header.blue_score);
+                undo.merge_coinbases.extend(created);
+            }
+        }
+        Ok(undo)
+    }
+
     fn reorganize(&self, old_tip_opt: Option<Hash>, new_tip: Hash) -> Result<(), String> {
         use borsh::BorshDeserialize;
         let old_tip = match old_tip_opt {
@@ -973,8 +1112,7 @@ impl ZentraNode {
                     .map_err(|e| format!("database error: {e}"))?
                     .ok_or_else(|| format!("missing block data for block {new_tip}"))?;
                 self.validate_block_transactions(&block, &utxo)?;
-                let undo = utxo.apply_block(&block, block.header.blue_score)
-                    .map_err(|e| format!("failed to apply block {new_tip}: {e}"))?;
+                let undo = self.apply_block_with_merges(&mut utxo, &block)?;
                 self.dag.put_undo(&new_tip, &undo)
                     .map_err(|e| format!("failed to store undo: {e}"))?;
                 return Ok(());
@@ -1056,7 +1194,7 @@ impl ZentraNode {
                         err_reason = format!("transaction validation failed for block {hash}: {e}");
                         break;
                     }
-                    match utxo.apply_block(&b, b.header.blue_score) {
+                    match self.apply_block_with_merges(&mut utxo, &b) {
                         Ok(undo) => {
                             if let Err(e) = self.dag.put_undo(hash, &undo) {
                                 success = false;
@@ -1089,7 +1227,7 @@ impl ZentraNode {
             }
             for hash in disconnected_so_far.iter().rev() {
                 if let Ok(Some(b)) = self.dag.get_block(hash) {
-                    if let Ok(undo) = utxo.apply_block(&b, b.header.blue_score) {
+                    if let Ok(undo) = self.apply_block_with_merges(&mut utxo, &b) {
                         let _ = self.dag.put_undo(hash, &undo);
                     }
                 }
@@ -1233,15 +1371,32 @@ impl ZentraNode {
         if h.len() > 100 { h.remove(0); }
         drop(h);
 
-        // Pool block accounting
+        // Pool block accounting (operator side). A block whose coinbase pays the
+        // pool wallet counts as a pool block. If its coinbase is tagged with a
+        // member's payout address, credit that member — this is a NON-SPOOFABLE
+        // pool reward (a real, PoW-proven block, attributed on-chain) that works at
+        // any difficulty, including low devnet difficulty where sub-block shares are
+        // too rare to form. Each pool block is worth a batch of shares.
         if self.pool_mode.load(std::sync::atomic::Ordering::Relaxed) {
             let pool_addr = self.pool.lock().address.clone();
-            let paid_pool = block.transactions.first()
-                .filter(|tx| tx.is_coinbase())
-                .map(|cb| cb.outputs.iter().any(|o| matches!(o,
-                    zentra_core::transaction::TxOutput::Standard { address, .. } if address.to_string() == pool_addr)))
-                .unwrap_or(false);
-            if paid_pool { self.pool.lock().blocks_found += 1; }
+            if let Some(cb) = block.transactions.first().filter(|tx| tx.is_coinbase()) {
+                let pays_pool = cb.outputs.iter().any(|o| matches!(o,
+                    zentra_core::transaction::TxOutput::Standard { address, .. } if address.to_string() == pool_addr));
+                if pays_pool {
+                    self.pool.lock().blocks_found += 1;
+                    // Credit the tagged member (coinbase payload after the 8-byte
+                    // height prefix). A full pool block is worth 256 shares (it is
+                    // 256× harder than a share target).
+                    if cb.payload.len() > 8 {
+                        if let Ok(member) = String::from_utf8(cb.payload[8..].to_vec()) {
+                            if Address::from_bech32(&member).is_ok() {
+                                let mut pool = self.pool.lock();
+                                for _ in 0..256 { pool.add_share(&member); }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         tracing::info!(height = block.header.blue_score, hash = %hash, "accepted block");

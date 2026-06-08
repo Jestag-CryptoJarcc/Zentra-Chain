@@ -267,6 +267,10 @@ struct NodeState {
     selected_tip: String,
     ztr_balance: f64,
     recent_blocks: Vec<serde_json::Value>,
+    /// Full-chain blocks involving our address (for the Transactions tab history).
+    /// Persisted on the node, so it survives wallet/node restarts.
+    address_blocks: Vec<serde_json::Value>,
+    poll_tick: u64,
     is_mining: bool,
     mining_lane: u8,
     mining_address: String,
@@ -310,6 +314,8 @@ impl Default for NodeState {
             selected_tip: "—".into(),
             ztr_balance: 0.0,
             recent_blocks: vec![],
+            address_blocks: vec![],
+            poll_tick: 0,
             is_mining: false,
             mining_lane: 0,
             mining_address: String::new(),
@@ -375,6 +381,7 @@ struct ZentraApp {
     // Thread bug fix: persists user's choice between frames, only init once from daemon
     mining_threads_local: u32,
     mining_threads_set: bool,
+    pool_target_input: String,
     /// false = solo mining (rewards to own address), true = pool mining
     pool_mining: bool,
 
@@ -508,6 +515,7 @@ impl ZentraApp {
             restore_input: String::new(),
             mining_threads_local: 2,
             mining_threads_set: false,
+            pool_target_input: String::new(),
             pool_mining: true, // Pool mining is the standard/default mode
             console_input: String::new(),
             console_history: vec![],
@@ -860,7 +868,7 @@ impl eframe::App for ZentraApp {
                 s.network_name.clone(), s.protocol_version,
                 s.mining_threads_daemon, s.max_mining_threads,
                 s.block_reward, s.blocks_until_halving, s.days_until_halving,
-                s.pending_txs.clone(),
+                s.pending_txs.clone(), s.address_blocks.clone(),
             )
         };
         let (connected, height, tips, tip_hash, ztr_bal, recent_blocks,
@@ -868,7 +876,7 @@ impl eframe::App for ZentraApp {
              difficulty, target_ms, amm_ztr, amm_zusd, amm_lp_burned,
              mempool, peers, net_hash, net_name, proto_ver,
              threads_daemon, max_threads, block_reward,
-             halving_blocks, halving_days, pending_txs) = ns;
+             halving_blocks, halving_days, pending_txs, address_blocks) = ns;
 
         // Init thread slider once from daemon
         if !self.mining_threads_set && threads_daemon > 0 {
@@ -1600,7 +1608,10 @@ impl eframe::App for ZentraApp {
                                           let _ = std::process::Command::new("cmd")
                                             .args(["/c","start","https://github.com/Jestag-CryptoJarcc/Zentra-Chain/releases/latest"])
                                             .creation_flags(0x08000000).spawn(); }
-                                        #[cfg(not(target_os = "windows"))]
+                                        #[cfg(target_os = "macos")]
+                                        { let _ = std::process::Command::new("open")
+                                            .arg("https://github.com/Jestag-CryptoJarcc/Zentra-Chain/releases/latest").spawn(); }
+                                        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
                                         { let _ = std::process::Command::new("xdg-open")
                                             .arg("https://github.com/Jestag-CryptoJarcc/Zentra-Chain/releases/latest").spawn(); }
                                     }
@@ -1680,7 +1691,11 @@ impl eframe::App for ZentraApp {
                                 &mut self.notification,
                             ),
                             Tab::Transactions => tab_transactions(
-                                ui, &recent_blocks, &pending_txs, &self.address,
+                                // Full persisted history for our address; fall back to
+                                // recent blocks until the first history fetch lands.
+                                ui,
+                                if address_blocks.is_empty() { &recent_blocks } else { &address_blocks },
+                                &pending_txs, &self.address,
                                 height,
                                 col_surface, col_surface2, col_border,
                                 col_text, col_muted, col_green, col_red, col_amber, col_accent,
@@ -1696,6 +1711,7 @@ impl eframe::App for ZentraApp {
                                 &mut self.pool_mining,
                                 &pool_addr, pool_pending, pool_miners, pool_payout_ms,
                                 pool_paid, pool_share,
+                                &mut self.pool_target_input,
                                 col_surface, col_surface2, col_border,
                                 col_text, col_muted,
                                 col_green, col_amber, col_blue, col_red,
@@ -2525,6 +2541,7 @@ fn tab_mining(
     pool_payout_ms: u64,
     pool_my_paid_zents: u64,
     pool_my_share_pct: f64,
+    pool_target_input: &mut String,
     col_surface: egui::Color32,
     col_surface2: egui::Color32,
     col_border: egui::Color32,
@@ -2613,7 +2630,24 @@ fn tab_mining(
         });
         ui.add_space(12.0);
         if *pool_mining {
-            ui.label(egui::RichText::new("Rewards collect in the pool wallet and pay back every 30 min, proportional to your hashrate (1% operator fee).").size(11.0).color(col_muted));
+            ui.label(egui::RichText::new("Rewards collect in the pool wallet and pay back every 30 min, proportional to your verified work (1% operator fee).").size(11.0).color(col_muted));
+            ui.add_space(8.0);
+            // Connect to a specific pool (the operator's pool wallet address). Leave
+            // empty to auto-use the network's pool once your node learns it.
+            ui.label(egui::RichText::new("Pool to mine into (operator's pool address — leave empty to auto-detect):").size(11.0).color(col_muted));
+            ui.horizontal(|ui| {
+                ui.add(egui::TextEdit::singleline(pool_target_input)
+                    .hint_text("zentradev1… (the pool you want to join)")
+                    .desired_width((ui.available_width()-92.0).max(120.0)));
+                if ui.add(egui::Button::new(egui::RichText::new("  Connect  ").size(12.0).color(egui::Color32::WHITE).strong())
+                    .fill(egui::Color32::from_rgb(115,80,18)).rounding(8.0)).clicked() {
+                    let t = pool_target_input.trim().to_string();
+                    let _ = call_rpc("poolSetTarget", json!([t]));
+                    let _ = call_rpc("poolJoin", json!([payout_address]));
+                    *notification = Some((if t.is_empty() {"Pool set to auto-detect.".into()}
+                        else {"Connected — mining will pay into that pool.".into()}, false, 4.0));
+                }
+            });
             if !pool_addr.is_empty() {
                 ui.add_space(10.0);
                 egui::Grid::new("pool_grid").num_columns(2).spacing([18.0, 7.0]).show(ui, |ui| {
@@ -2671,10 +2705,12 @@ fn tab_mining(
                             std::thread::sleep(Duration::from_millis(1500));
                         }
                         if *pool_mining {
-                            // Join as a POOL MEMBER: our node mines into the operator's
-                            // shared pool wallet (learned from the seed over P2P) and the
-                            // operator credits our payout address. We do NOT become our
-                            // own operator, so every pool miner feeds the one VPS pool.
+                            // Connect to the chosen pool (if the user entered one),
+                            // then join as a POOL MEMBER: our node mines into that
+                            // operator's pool wallet and the operator credits our
+                            // payout address for verified shares/blocks. Empty = auto.
+                            let target = pool_target_input.trim().to_string();
+                            let _ = call_rpc("poolSetTarget", json!([target]));
                             let _ = call_rpc("poolJoin", json!([payout_address]));
                             match call_rpc("startMining", json!([0u8, payout_address])) {
                                 Ok(_)  => *notification = Some(("Pool mining started — earning shares.".into(), false, 4.0)),
@@ -2998,7 +3034,9 @@ fn tab_network(
                         .creation_flags(0x08000000)
                         .spawn();
                 }
-                #[cfg(not(target_os = "windows"))]
+                #[cfg(target_os = "macos")]
+                { let _ = std::process::Command::new("open").arg(url).spawn(); }
+                #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
                 { let _ = std::process::Command::new("xdg-open").arg(url).spawn(); }
             };
             if ui.add(egui::Button::new(egui::RichText::new("  ⬡ Explorer  ").color(egui::Color32::WHITE))
@@ -3937,6 +3975,13 @@ fn poll_node(state: &Arc<Mutex<NodeState>>) {
         None
     };
 
+    // Full address history is a heavy full-chain scan, so refresh it only every
+    // ~8 polls (and on the first poll) — it persists on the node either way.
+    let tick = { let mut s = state.lock().unwrap(); s.poll_tick = s.poll_tick.wrapping_add(1); s.poll_tick };
+    let addr_blocks = if !wallet_addr.is_empty() && tick % 8 == 1 {
+        call_rpc("getAddressBlocks", json!([wallet_addr])).ok().and_then(|r| r.as_array().cloned())
+    } else { None };
+
     let mut s = state.lock().unwrap();
     s.connected       = true;
     s.blue_score      = dag["blue_score"].as_u64().unwrap_or(0);
@@ -3966,6 +4011,7 @@ fn poll_node(state: &Arc<Mutex<NodeState>>) {
     s.peers           = net["peers"].as_array().cloned().unwrap_or_default();
     s.protocol_version = net["protocol_version"].as_u64().unwrap_or(1);
     if let Some(arr) = blocks.as_array() { s.recent_blocks = arr.clone(); }
+    if let Some(ab) = addr_blocks { s.address_blocks = ab; }
     if let Some(b) = ztr_balance { s.ztr_balance = b; }
     if let Some(arr) = mempool.as_array() { s.pending_txs = arr.clone(); }
 
@@ -4050,16 +4096,22 @@ fn spawn_daemon() -> Option<Child> {
     let dir = data_dir();
     std::fs::create_dir_all(&dir).ok();
     let log = std::fs::File::create(dir.join("zentrad.log")).ok();
+    // The node binary is `zentrad.exe` on Windows but `zentrad` on Linux/macOS.
+    // Hardcoding `.exe` meant the wallet never found/started its bundled node on
+    // Linux/Mac, so it hit 127.0.0.1:16111 with nothing there → "connection
+    // refused" (os error 111). Pick the right name per platform.
+    let bin_name = if cfg!(windows) { "zentrad.exe" } else { "zentrad" };
     let exe = std::env::current_exe().ok()
-        .and_then(|p| p.parent().map(|d| d.join("zentrad.exe")))
+        .and_then(|p| p.parent().map(|d| d.join(bin_name)))
         .filter(|p| p.exists())
-        .unwrap_or_else(|| std::path::PathBuf::from("zentrad.exe"));
+        .unwrap_or_else(|| std::path::PathBuf::from(bin_name));
     let mut cmd = Command::new(&exe);
     cmd.arg("--network").arg("devnet").arg("--data-dir").arg(dir.to_str().unwrap_or("zentra-data"));
-    if let Some(f) = log {
-        cmd.stdout(f.try_clone().unwrap_or_else(|_| std::fs::File::create("NUL").unwrap())).stderr(f);
-    } else {
-        cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    // Inherit the bundled node's reachable seed; route its output to a log file,
+    // falling back to null (cross-platform) if the log can't be opened.
+    match log.and_then(|f| f.try_clone().ok().map(|f2| (f, f2))) {
+        Some((f, f2)) => { cmd.stdout(f2).stderr(f); }
+        None => { cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()); }
     }
     #[cfg(target_os = "windows")]
     { use std::os::windows::process::CommandExt; cmd.creation_flags(0x08000000); }

@@ -170,9 +170,27 @@ fn handle_inbound(node: Arc<ZentraNode>, mut s: TcpStream) -> std::io::Result<()
                     let _ = send_json(&mut s, &json!({"t":"bye","reason":"genesis mismatch"}));
                     return Ok(());
                 }
+                // Learn this peer's REACHABLE address = its socket IP + the listening
+                // port it advertised, and remember it so we dial + gossip it. This is
+                // how a node anyone runs (with its P2P port open) becomes discoverable
+                // to the whole network instead of being seen only as an ephemeral port.
+                if let Some(port) = msg["p2p_port"].as_u64() {
+                    if let Ok(sa) = peer.parse::<std::net::SocketAddr>() {
+                        let reachable = format!("{}:{}", sa.ip(), port);
+                        let mut mp = node.manual_peers.lock();
+                        if mp.len() < 256 && !mp.contains(&reachable) {
+                            mp.push(reachable.clone());
+                            tracing::info!(peer = %reachable, "discovered reachable peer from handshake");
+                        }
+                    }
+                }
+                // Learn peers the dialer shared (backward-compatible field).
+                merge_peers(&node, &msg["peers"]);
+                let our_tip = node.dag.get_selected_tip().ok().flatten().map(|h| h.to_hex()).unwrap_or_default();
+                let our_peers: Vec<String> = node.manual_peers.lock().iter().take(50).cloned().collect();
                 send_json(&mut s, &json!({
                     "t":"hello","net":our_net,"genesis":our_genesis,
-                    "height": node.current_height()
+                    "height": node.current_height(), "tip": our_tip, "peers": our_peers
                 }))?;
             }
             "getblocks" => {
@@ -279,6 +297,20 @@ fn handle_inbound(node: Arc<ZentraNode>, mut s: TcpStream) -> std::io::Result<()
                 }
                 send_json(&mut s, &json!({"t":"addtxs_ack"}))?;
             }
+            // Pool member submitting verified-PoW shares. We (the operator) verify
+            // each share's PoW + coinbase tag and credit the tagged member. No reply
+            // (one-way), so older nodes that don't send this are unaffected.
+            "poolshare" => {
+                if let Some(arr) = msg["shares"].as_array() {
+                    let mut credited = 0u32;
+                    for h in arr.iter().take(500) {
+                        if let Some(b) = h.as_str().and_then(decode_block) {
+                            if node.verify_and_credit_share(&b) { credited += 1; }
+                        }
+                    }
+                    if credited > 0 { debug!(credited, "credited verified pool shares"); }
+                }
+            }
             "bye" => return Ok(()),
             _ => {}
         }
@@ -299,6 +331,19 @@ pub fn start_dialer(node: Arc<ZentraNode>) {
         loop {
             node.mempool.evict_older_than(MEMPOOL_EXPIRY_MS);
             let peers = node.manual_peers.lock().clone();
+            // Persist the current peer set so discovered peers are remembered across
+            // restarts (main.rs reloads peers.txt on startup). Skip the loopback
+            // self-entry. Best-effort; written every cycle (small file).
+            {
+                let lines: Vec<String> = peers.iter()
+                    .filter(|p| !p.starts_with("127.0.0.1") && !p.is_empty())
+                    .cloned().collect();
+                if !lines.is_empty() {
+                    let path = node.config.data_dir.join("peers.txt");
+                    let body = format!("# Auto-saved known peers — edit freely (one host:port per line)\n{}\n", lines.join("\n"));
+                    let _ = std::fs::write(&path, body);
+                }
+            }
             for addr in peers {
                 let n = Arc::clone(&node);
                 let a = addr.clone();
@@ -337,6 +382,20 @@ pub fn broadcast_block(node: &Arc<ZentraNode>, block: &zentra_core::block::Block
     }
 }
 
+/// Merge a JSON array of "host:port" peer addresses into our peer table (bounded,
+/// deduped). Used to learn peers another node shares in its `hello` — this is the
+/// backward-compatible discovery path (old nodes just omit the field).
+fn merge_peers(node: &Arc<ZentraNode>, val: &serde_json::Value) {
+    if let Some(arr) = val.as_array() {
+        let mut mp = node.manual_peers.lock();
+        for v in arr.iter().filter_map(|v| v.as_str()) {
+            if mp.len() >= 256 { break; }
+            let a = v.to_string();
+            if !a.is_empty() && a.contains(':') && !mp.contains(&a) { mp.push(a); }
+        }
+    }
+}
+
 fn sync_from_peer(node: &Arc<ZentraNode>, addr: &str) -> std::io::Result<()> {
     let mut s = TcpStream::connect_timeout(
         &addr.parse().map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "bad peer addr"))?,
@@ -348,9 +407,12 @@ fn sync_from_peer(node: &Arc<ZentraNode>, addr: &str) -> std::io::Result<()> {
     let our_net = node.config.network.to_string();
     let our_genesis = node.genesis_hash.to_hex();
 
-    // Handshake
+    // Handshake (include our selected-tip hash so each side can detect a divergent chain)
+    let our_tip = node.dag.get_selected_tip().ok().flatten().map(|h| h.to_hex()).unwrap_or_default();
+    let our_peers: Vec<String> = node.manual_peers.lock().iter().take(50).cloned().collect();
     send_json(&mut s, &json!({
-        "t":"hello","net":our_net,"genesis":our_genesis,"height":node.current_height()
+        "t":"hello","net":our_net,"genesis":our_genesis,"height":node.current_height(),"tip":our_tip,
+        "p2p_port": node.config.p2p_port, "peers": our_peers
     }))?;
     let hello = recv_json(&mut s)?;
     if hello["t"].as_str() != Some("hello") {
@@ -360,17 +422,28 @@ fn sync_from_peer(node: &Arc<ZentraNode>, addr: &str) -> std::io::Result<()> {
         debug!(peer = %addr, "genesis mismatch — not syncing");
         return Ok(());
     }
+    // Learn the peers this node knows (backward-compatible: absent on old nodes).
+    merge_peers(node, &hello["peers"]);
 
     // If the peer is BEHIND us, push our history up to them (in order). This is
     // how a public seed node gets the full chain from miners behind NAT: the
     // miner always initiates the connection, so it pushes its blocks here.
     let peer_height = hello["height"].as_u64().unwrap_or(0);
+    // Do we recognize the peer's selected tip? If not, the peer is on a DIFFERENT
+    // (divergent) chain, and pushing only blocks above its height would orphan on
+    // its side. In that case push from genesis so it receives our whole chain and
+    // can reorg to it when ours is heavier (this is what makes divergent chains —
+    // e.g. a NAT'd miner that's ahead — converge).
+    let peer_tip_known = hello["tip"].as_str()
+        .and_then(|h| Hash::from_hex(h).ok())
+        .map(|h| matches!(node.dag.get_block(&h), Ok(Some(_))))
+        .unwrap_or(false);
     // Track the highest chain a peer has — the miner uses this to avoid mining
     // a competing fork while we're still behind.
     node.max_peer_height.fetch_max(peer_height, std::sync::atomic::Ordering::Relaxed);
     let mut our_height = node.current_height();
     if our_height > peer_height {
-        let mut from = peer_height;
+        let mut from = if peer_tip_known { peer_height } else { 0 };
         loop {
             let batch = node.blocks_above(from, SYNC_BATCH);
             if batch.is_empty() { break; }
@@ -386,10 +459,12 @@ fn sync_from_peer(node: &Arc<ZentraNode>, addr: &str) -> std::io::Result<()> {
         let _ = our_height; // (height may have advanced; pull loop re-reads it)
     }
 
-    // Peer-exchange: share our known peers with the remote and request theirs.
-    // This is how Bitcoin/LTC nodes self-discover the network organically.
+    // Peer-exchange: push our known peers to the remote (one-way, fire-and-forget
+    // so it stays compatible with older nodes that don't reply). Pulling the
+    // remote's peers happens via the `hello` handshake (see below), which old
+    // nodes simply omit — no protocol desync across versions.
     {
-        let known: Vec<String> = node.manual_peers.lock().iter().take(20).cloned().collect();
+        let known: Vec<String> = node.manual_peers.lock().iter().take(50).cloned().collect();
         let _ = send_json(&mut s, &json!({"t":"addrs","addrs":known}));
     }
 
@@ -429,6 +504,9 @@ fn sync_from_peer(node: &Arc<ZentraNode>, addr: &str) -> std::io::Result<()> {
             }
             if let Some(h) = ack["hashrate"].as_f64() {
                 *node.learned_pool_hashrate.lock() = h;
+                // The seed reports the whole-network hashrate here; remember it so
+                // our (NAT'd) wallet can show the real network total, not just us.
+                *node.learned_network_hashrate.lock() = h;
             }
             // Learn the operator's pool wallet so we (as a member) mine into it.
             if ack["pool_mode"].as_bool().unwrap_or(false) {
@@ -436,6 +514,21 @@ fn sync_from_peer(node: &Arc<ZentraNode>, addr: &str) -> std::io::Result<()> {
                     if !pa.is_empty() { *node.learned_operator_pool.lock() = pa.to_string(); }
                 }
             }
+        }
+    }
+
+    // Submit any pool shares we've found. Sent to whichever peer we're syncing
+    // with: only the pool OPERATOR will credit them (it verifies the PoW + coinbase
+    // tag); any non-operator safely ignores them. One-way + best-effort, and old
+    // nodes ignore the unknown message — so it's fully backward-compatible.
+    {
+        let shares: Vec<zentra_core::block::Block> = {
+            let mut p = node.pending_shares.lock();
+            if p.is_empty() { Vec::new() } else { std::mem::take(&mut *p) }
+        };
+        if !shares.is_empty() {
+            let hexes: Vec<String> = shares.iter().take(200).map(encode_block).collect();
+            let _ = send_json(&mut s, &json!({"t":"poolshare","shares":hexes}));
         }
     }
 

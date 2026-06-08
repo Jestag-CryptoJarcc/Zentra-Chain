@@ -155,6 +155,17 @@ pub fn verify_block_pow(header: &zentra_core::header::Header) -> ZentraResult<()
     }
 }
 
+/// Compute a header's PoW hash and check it meets an ARBITRARY target. Used to
+/// verify pool shares, where the share target is easier than the block target.
+pub fn pow_meets_target(header: &zentra_core::header::Header, target: &Hash) -> bool {
+    let verifier = get_verifier(header.lane_id);
+    let mut hc = header.clone();
+    hc.nonce = 0;
+    let header_bytes = match borsh::to_vec(&hc) { Ok(b) => b, Err(_) => return false };
+    let pow_hash = verifier.compute_pow_hash(&header_bytes, header.nonce);
+    pow_hash.meets_target(target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

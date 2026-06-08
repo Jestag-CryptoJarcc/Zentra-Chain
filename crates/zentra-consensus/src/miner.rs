@@ -67,6 +67,28 @@ pub struct Miner {
     pub address: Address,
     pub is_mining: Arc<AtomicBool>,
     pub hashes_done: Option<Arc<AtomicU64>>,
+    /// Pool share target (easier than the block target). When set, every nonce
+    /// whose PoW meets this target — but NOT the block target — is recorded as a
+    /// pool "share" (proof of partial work) for the operator to verify and credit.
+    pub share_target: Option<Hash>,
+    /// Sink collecting found share nonces while mining the current template.
+    pub shares: Option<Arc<std::sync::Mutex<Vec<u64>>>>,
+    /// Extra bytes appended to the coinbase payload — used by pool members to tag
+    /// the block with their payout address so the operator credits the right miner.
+    pub coinbase_tag: Vec<u8>,
+}
+
+/// Pool share target = block target made ~256× easier (share difficulty =
+/// block difficulty / 256). Both the member (to find shares) and the operator
+/// (to verify them) derive it identically from the block's difficulty bits, so
+/// no separate value needs to be published or trusted.
+pub fn share_target_from_bits(bits: u32) -> Hash {
+    let t = Header::target_from_bits(bits);
+    let b = t.as_bytes();
+    if b[0] != 0 { return Hash([0xFF; 32]); } // would overflow → easiest target
+    let mut out = [0u8; 32];
+    out[..31].copy_from_slice(&b[1..32]); // shift left 8 bits = ×256 (easier)
+    Hash(out)
 }
 
 impl Miner {
@@ -77,6 +99,9 @@ impl Miner {
             address,
             is_mining: Arc::new(AtomicBool::new(true)),
             hashes_done: None,
+            share_target: None,
+            shares: None,
+            coinbase_tag: Vec::new(),
         }
     }
 
@@ -102,7 +127,12 @@ impl Miner {
         // header.blue_score as the UTXO height).
         let height = blue_score;
         let reward = emission.block_reward(height).saturating_add(fees);
-        let coinbase = Transaction::create_coinbase(reward, self.address.clone(), height);
+        let mut coinbase = Transaction::create_coinbase(reward, self.address.clone(), height);
+        // Pool members tag the coinbase payload with their payout address so the
+        // operator can credit them for the shares/blocks this template produces.
+        if !self.coinbase_tag.is_empty() {
+            coinbase.payload.extend_from_slice(&self.coinbase_tag);
+        }
 
         let mut all_txs = vec![coinbase];
         all_txs.extend(transactions);
@@ -172,6 +202,8 @@ impl Miner {
             let found_nonce = Arc::clone(&found_nonce);
             let found = Arc::clone(&found);
             let hashes_done = self.hashes_done.as_ref().map(Arc::clone);
+            let share_target = self.share_target;
+            let shares_sink = self.shares.as_ref().map(Arc::clone);
             let lane_id = self.lane;
 
             // Pin this thread to logical core (thread_idx × stride) % logical_total.
@@ -192,6 +224,17 @@ impl Miner {
                             counter.fetch_add(local_hashes, Ordering::Relaxed);
                         }
                         local_hashes = 0;
+                    }
+                    // Pool share: PoW meets the (easier) share target but not the
+                    // block target — record the nonce as proof of partial work.
+                    if let Some(st) = share_target {
+                        if pow_hash.meets_target(&st) && !pow_hash.meets_target(&target) {
+                            if let Some(sink) = &shares_sink {
+                                if let Ok(mut v) = sink.lock() {
+                                    if v.len() < 100_000 { v.push(nonce); }
+                                }
+                            }
+                        }
                     }
                     if pow_hash.meets_target(&target) {
                         if local_hashes > 0 {

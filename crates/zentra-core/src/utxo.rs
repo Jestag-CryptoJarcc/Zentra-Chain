@@ -35,6 +35,11 @@ pub struct TxUndoData {
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize, Serialize, Deserialize)]
 pub struct BlockUndoData {
     pub txs_undo: Vec<TxUndoData>,
+    /// Outpoints created by the coinbases of blue MERGE blocks that were paid
+    /// alongside this selected-chain block (DAG reward fairness). Tracked so a
+    /// reorg that disconnects this block also removes those merge rewards.
+    #[serde(default)]
+    pub merge_coinbases: Vec<OutPoint>,
 }
 
 /// In-memory UTXO set for fast lookups.
@@ -65,7 +70,37 @@ impl UtxoSet {
             let tx_undo = self.apply_transaction(tx, height)?;
             txs_undo.push(tx_undo);
         }
-        Ok(BlockUndoData { txs_undo })
+        Ok(BlockUndoData { txs_undo, merge_coinbases: Vec::new() })
+    }
+
+    /// Credit ONLY the coinbase reward of a blue MERGE block — a valid block that
+    /// solved the PoW but lost the selected-tip race. In a BlockDAG every block
+    /// that does real work should be paid (unlike Bitcoin, which orphans the
+    /// loser). We apply just the coinbase outputs (not the merge block's regular
+    /// transactions, which are settled on the selected chain) so the miner who
+    /// found it gets their reward. Returns the outpoints created, for undo.
+    /// No-op (returns empty) if the coinbase was already credited.
+    pub fn apply_merge_coinbase(&mut self, block: &Block, height: u64) -> Vec<OutPoint> {
+        let mut created = Vec::new();
+        let cb = match block.transactions.first() {
+            Some(tx) if tx.is_coinbase() => tx,
+            _ => return created,
+        };
+        let txid = cb.txid();
+        for (idx, output) in cb.outputs.iter().enumerate() {
+            if let TxOutput::Standard { address, amount, .. } = output {
+                let outpoint = OutPoint::new(txid, idx as u32);
+                if self.utxos.contains_key(&outpoint) { continue; } // already credited
+                self.utxos.insert(outpoint.clone(), UtxoEntry {
+                    amount: *amount,
+                    address: address.clone(),
+                    block_height: height,
+                    is_coinbase: true,
+                });
+                created.push(outpoint);
+            }
+        }
+        created
     }
 
     /// Apply a single transaction to the UTXO set.
@@ -144,6 +179,12 @@ impl UtxoSet {
                 let outpoint = OutPoint::new(input.prev_tx_hash, input.output_index);
                 self.utxos.insert(outpoint, entry.clone());
             }
+        }
+
+        // 3. Remove any blue merge-block coinbase rewards that were credited
+        //    alongside this block.
+        for outpoint in &undo.merge_coinbases {
+            self.utxos.remove(outpoint);
         }
 
         Ok(())

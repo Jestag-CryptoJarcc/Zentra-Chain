@@ -105,6 +105,11 @@ pub trait ZentraRpc {
     #[method(name = "getRecentBlocks")]
     async fn get_recent_blocks(&self) -> RpcResult<serde_json::Value>;
 
+    /// Get ALL blocks that involve an address (full-chain wallet history, read
+    /// from the persisted DAG so it survives restarts).
+    #[method(name = "getAddressBlocks")]
+    async fn get_address_blocks(&self, address: String) -> RpcResult<serde_json::Value>;
+
     /// Stop the node daemon cleanly.
     #[method(name = "stopNode")]
     async fn stop_node(&self) -> RpcResult<String>;
@@ -161,6 +166,12 @@ pub trait ZentraRpc {
     /// Set the operator address that receives the 1% fee on each payout.
     #[method(name = "poolSetOperatorAddress")]
     async fn pool_set_operator_address(&self, address: String) -> RpcResult<String>;
+
+    /// Connect to a specific pool: set the operator's pool wallet this node mines
+    /// into as a member (instead of waiting to learn it from the seed). Empty
+    /// string clears it (back to auto-learn).
+    #[method(name = "poolSetTarget")]
+    async fn pool_set_target(&self, pool_address: String) -> RpcResult<String>;
 
     /// Manually add a peer (host:port) to connect to.
     #[method(name = "addPeer")]
@@ -823,6 +834,106 @@ impl ZentraRpcServer for RpcServer {
         Ok(serde_json::json!(blocks_json))
     }
 
+    async fn get_address_blocks(&self, address_str: String) -> RpcResult<serde_json::Value> {
+        let address = Address::from_bech32(&address_str).map_err(map_rpc_err)?;
+        let network = self.node.config.network;
+        let selected_tip = self.node.dag.get_selected_tip().ok().flatten();
+        let tip_score = selected_tip
+            .and_then(|tip| self.node.dag.get_header(&tip).ok().flatten())
+            .map(|h| h.blue_score)
+            .unwrap_or(0);
+        let selected_chain: std::collections::HashSet<Hash> = if let Some(tip) = selected_tip {
+            self.node.get_selected_chain(tip).into_iter().collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
+        // Walk the WHOLE DAG (BFS from tips over all parents) and keep blocks that
+        // involve this address — its coinbase/received outputs or sent inputs.
+        // Reads from the persisted chain, so a wallet always sees its full history
+        // regardless of restarts.
+        let involves = |block: &zentra_core::block::Block| -> bool {
+            for tx in &block.transactions {
+                for o in &tx.outputs {
+                    if let zentra_core::transaction::TxOutput::Standard { address: a, .. } = o {
+                        if a == &address { return true; }
+                    }
+                }
+                for i in &tx.inputs {
+                    let mut pk = [0u8; 32];
+                    let len = i.public_key.len().min(32);
+                    pk[..len].copy_from_slice(&i.public_key[..len]);
+                    if Address::from_public_key(&pk, network) == address { return true; }
+                }
+            }
+            false
+        };
+
+        let mut visited: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+        let mut queue: Vec<Hash> = self.node.dag.get_tips();
+        let mut matched: Vec<zentra_core::block::Block> = Vec::new();
+        let mut scanned = 0usize;
+        while let Some(hash) = queue.pop() {
+            if !visited.insert(hash) { continue; }
+            scanned += 1;
+            if scanned > 200_000 || matched.len() >= 1000 { break; }
+            if let Ok(Some(block)) = self.node.dag.get_block(&hash) {
+                if involves(&block) { matched.push(block.clone()); }
+                for p in &block.header.parents {
+                    if !visited.contains(p) { queue.push(*p); }
+                }
+            }
+        }
+        // Oldest first (same ordering as getRecentBlocks, which the wallet expects).
+        matched.sort_by(|a, b| a.header.blue_score.cmp(&b.header.blue_score));
+
+        let blocks_json: Vec<serde_json::Value> = matched.iter().map(|block| {
+            let hash = block.hash();
+            let is_selected = selected_chain.contains(&hash);
+            let txs: Vec<serde_json::Value> = block.transactions.iter().map(|tx| {
+                let inputs_json: Vec<serde_json::Value> = tx.inputs.iter().map(|i| {
+                    let mut pk = [0u8; 32];
+                    let len = i.public_key.len().min(32);
+                    pk[..len].copy_from_slice(&i.public_key[..len]);
+                    let sender = Address::from_public_key(&pk, network);
+                    serde_json::json!({
+                        "sender_address": sender.to_string(),
+                        "prev_tx_hash": i.prev_tx_hash.to_hex(),
+                        "output_index": i.output_index,
+                    })
+                }).collect();
+                let outputs_json: Vec<serde_json::Value> = tx.outputs.iter().map(|o| match o {
+                    zentra_core::transaction::TxOutput::Standard { address, amount, .. } =>
+                        serde_json::json!({ "type": "standard", "address": address.to_string(), "amount": amount.as_zents() }),
+                    zentra_core::transaction::TxOutput::Burn { amount, burn_type } =>
+                        serde_json::json!({ "type": "burn", "amount": amount.as_zents(), "burn_type": format!("{:?}", burn_type) }),
+                }).collect();
+                serde_json::json!({
+                    "txid": tx.txid().to_hex(),
+                    "type": format!("{:?}", tx.tx_type),
+                    "inputs": inputs_json,
+                    "outputs": outputs_json,
+                })
+            }).collect();
+            let confirmations = tip_score.saturating_sub(block.header.blue_score) + 1;
+            serde_json::json!({
+                "hash": hash.to_hex(),
+                "version": block.header.version,
+                "parents": block.header.parents.iter().map(|h| h.to_hex()).collect::<Vec<_>>(),
+                "merkle_root": block.header.merkle_root.to_hex(),
+                "timestamp": block.header.timestamp,
+                "nonce": block.header.nonce,
+                "lane_id": block.header.lane_id as u8,
+                "bits": block.header.bits,
+                "blue_score": block.header.blue_score,
+                "confirmations": confirmations,
+                "is_selected": is_selected,
+                "transactions": txs,
+            })
+        }).collect();
+        Ok(serde_json::json!(blocks_json))
+    }
+
     async fn stop_node(&self) -> RpcResult<String> {
         tracing::info!("RPC request to stop node received");
         let tx = self.shutdown_tx.clone();
@@ -1399,6 +1510,20 @@ impl ZentraRpcServer for RpcServer {
         // Persist so it survives restarts.
         let _ = std::fs::write(self.node.config.data_dir.join("pool_operator.txt"), &address);
         Ok("operator address set".to_string())
+    }
+
+    async fn pool_set_target(&self, pool_address: String) -> RpcResult<String> {
+        let addr = pool_address.trim().to_string();
+        if addr.is_empty() {
+            *self.node.learned_operator_pool.lock() = String::new();
+            let _ = std::fs::remove_file(self.node.config.data_dir.join("pool_target.txt"));
+            return Ok("pool target cleared".to_string());
+        }
+        Address::from_bech32(&addr).map_err(map_rpc_err)?;
+        *self.node.learned_operator_pool.lock() = addr.clone();
+        // Persist so the chosen pool survives restarts.
+        let _ = std::fs::write(self.node.config.data_dir.join("pool_target.txt"), &addr);
+        Ok("pool target set".to_string())
     }
 
     async fn add_peer(&self, address: String) -> RpcResult<String> {

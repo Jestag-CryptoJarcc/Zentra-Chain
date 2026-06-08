@@ -460,9 +460,49 @@ async fn start_web_server(port: u16, token: String, network: zentra_types::Netwo
                         return;
                     }
 
-                    // Anything that isn't /rpc gets a tiny status payload. This
-                    // node does NOT host the website — it only answers API calls.
-                    let body = "{\"service\":\"zentra-node\",\"api\":\"POST JSON-RPC to /rpc\",\"network\":\"devnet\"}";
+                    // Optional static website hosting. If ZENTRA_WEB_DIR is set (or a
+                    // `web` folder sits next to the binary), the node serves the site
+                    // from it SAME-ORIGIN with /rpc — exactly like nginx would. Handy
+                    // for local previews and simple single-box deploys. When no web
+                    // dir is present it falls back to a status JSON (API-only).
+                    if req.starts_with("GET") {
+                        let web_dir = std::env::var("ZENTRA_WEB_DIR").ok()
+                            .map(std::path::PathBuf::from)
+                            .or_else(|| std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.join("web"))))
+                            .filter(|d| d.is_dir());
+                        if let Some(dir) = web_dir {
+                            let mut rel = path.split('?').next().unwrap_or("/").trim_start_matches('/').to_string();
+                            if rel.is_empty() { rel = "index.html".to_string(); }
+                            if !rel.contains("..") {
+                                let mut fp = dir.join(&rel);
+                                if fp.is_dir() { fp = fp.join("index.html"); }
+                                if !fp.exists() && !rel.contains('.') { fp = dir.join(format!("{}.html", rel)); }
+                                if let Ok(bytes) = std::fs::read(&fp) {
+                                    let ct = match fp.extension().and_then(|e| e.to_str()).unwrap_or("") {
+                                        "html" => "text/html; charset=utf-8",
+                                        "css" => "text/css",
+                                        "js" => "application/javascript",
+                                        "json" => "application/json",
+                                        "png" => "image/png",
+                                        "jpg" | "jpeg" => "image/jpeg",
+                                        "svg" => "image/svg+xml",
+                                        "ico" => "image/x-icon",
+                                        "txt" => "text/plain",
+                                        "xml" => "application/xml",
+                                        _ => "application/octet-stream",
+                                    };
+                                    let header = format!("HTTP/1.1 200 OK\r\nContent-Type: {}\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", ct, bytes.len());
+                                    let _ = socket.write_all(header.as_bytes()).await;
+                                    let _ = socket.write_all(&bytes).await;
+                                    let _ = socket.flush().await;
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
+                    // Fallback: API-only status payload.
+                    let body = "{\"service\":\"zentra-node\",\"api\":\"POST JSON-RPC to /rpc\"}";
                     let _ = socket.write_all(format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(), body).as_bytes()).await;

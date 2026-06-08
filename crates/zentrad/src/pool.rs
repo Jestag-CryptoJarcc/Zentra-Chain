@@ -147,6 +147,25 @@ impl MiningPool {
         m.last_seen_ms = now;
     }
 
+    /// Credit ONE VERIFIED proof-of-work share to a miner. Unlike `heartbeat`
+    /// (self-reported, spoofable), this is called only after the operator has
+    /// verified the share's PoW — so it is the non-spoofable basis for payouts.
+    /// Also maintains a rough hashrate estimate from the share arrival rate for
+    /// display purposes.
+    pub fn add_share(&mut self, addr: &str) {
+        let now = now_ms();
+        let m = self.miners.entry(addr.to_string()).or_insert_with(|| MinerStat {
+            address: addr.to_string(),
+            hashrate: 0.0,
+            shares: 0.0,
+            last_seen_ms: now,
+            joined_ms: now,
+            total_paid_zents: 0,
+        });
+        m.shares += 1.0;
+        m.last_seen_ms = now;
+    }
+
     /// Drop miners that have not been seen within the timeout (their accrued
     /// shares are retained until payout so they still get paid for past work).
     pub fn prune_offline(&mut self) {
